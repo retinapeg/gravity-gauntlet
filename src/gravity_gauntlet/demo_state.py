@@ -130,8 +130,18 @@ class WorldState:
     lifecycle: list[dict[str, Any]] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def steps(self) -> int | None:
+        """Return the worker step count under the shared JSON contract name."""
+
+        return self.episode_length
+
     def to_dict(self) -> dict[str, Any]:
-        return json_safe(asdict(self))
+        result = asdict(self)
+        # Keep ``episode_length`` for existing consumers while exposing the
+        # literal GRAV 3 world-state contract name.
+        result["steps"] = self.steps
+        return json_safe(result)
 
     def visual_dict(self, *, generation: int | None = None) -> dict[str, Any]:
         """Return the real fields consumed by Agent 2's ghost renderer."""
@@ -147,6 +157,7 @@ class WorldState:
             "trajectory": json_safe(self.trajectory),
             "actions": json_safe(self.actions),
             "execution_backend": self.execution_backend,
+            "steps": self.steps,
         }
         if generation is not None:
             result["generation"] = int(generation)
@@ -182,6 +193,12 @@ class GenerationState:
         return len(self.worlds)
 
     @property
+    def policy_version_used(self) -> int:
+        """Return the frozen policy version evaluated by this generation."""
+
+        return self.policy_version
+
+    @property
     def champion(self) -> WorldState | None:
         if self.best_world is None:
             return None
@@ -205,11 +222,17 @@ class GenerationState:
             "trajectory": json_safe(champion.trajectory),
             "actions": json_safe(champion.actions),
             "execution_backend": champion.execution_backend,
+            "steps": champion.steps,
             "generation": self.generation,
         }
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        # ``policy_version`` remains for the current visual loader; the
+        # explicit alias makes the evaluated-vs-next version transition
+        # unambiguous to judge-facing and external consumers.
+        result["policy_version_used"] = self.policy_version_used
+        result["worlds"] = [world.to_dict() for world in self.worlds]
         result["world_count"] = self.world_count
         result["champion"] = self.champion_dict()
         # Agent 2's visual loader consumes a top-level ``rollouts`` list.
