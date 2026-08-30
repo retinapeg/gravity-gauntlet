@@ -1,9 +1,9 @@
 """Headless deterministic rollout boundary for Gravity Gauntlet.
 
-The worker intentionally contains no physics, policy, training loop, or
-Daytona SDK integration.  It calls the same ``GravityEnv`` used by the visual
-demo and keeps its input/output JSON-safe so a future sandbox runner can invoke
-this file directly.
+The worker intentionally contains no physics implementation, policy network
+definition, training loop, or Daytona SDK integration. It calls the same
+``GravityEnv`` and policy helpers used elsewhere, keeping its input/output
+JSON-safe so a sandbox runner can invoke this file directly.
 """
 
 from __future__ import annotations
@@ -11,134 +11,136 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import operator
+import os
 import sys
-from collections.abc import Iterable, Mapping, Sequence
-from itertools import repeat
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from gravity_env import GravityEnv
+from gravity_env import ACTION_HOLD_STEPS, OBSERVATION_DIM, GravityEnv
+from rl_policy import (
+    action_index_to_vector,
+    decode_policy_weights,
+    make_action_generator,
+    sample_action,
+    sample_random_action,
+)
 
 
-Action = Sequence[float]
-DEFAULT_MAX_STEPS = 600
+DEFAULT_MAX_STEPS = 500
+
+
+def _integer(value: Any, name: str, *, minimum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        result = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if result < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return result
 
 
 def run_rollout(
     seed: int,
-    actions: Iterable[Action] | None = None,
+    policy_version: int = 0,
+    policy_weights: str | None = None,
     max_steps: int = DEFAULT_MAX_STEPS,
+    *,
+    sandbox_id: str | None = None,
 ) -> dict[str, Any]:
-    """Execute one deterministic episode using only ``GravityEnv``.
+    """Run one complete categorical-policy episode using the shared physics.
 
-    ``actions`` is an iterable of ``[thrust_x, thrust_y]`` values.  If it is
-    omitted, the ship coasts with zero thrust until the environment ends or
-    ``max_steps`` is reached.  Reusing the same seed and actions reproduces the
-    same rollout.
+    ``max_steps`` counts policy decisions. Each decision is held for several
+    deterministic physics ticks inside :class:`GravityEnv`.
     """
-    seed = int(seed)
-    max_steps = int(max_steps)
-    if max_steps <= 0:
-        raise ValueError("max_steps must be greater than zero")
 
-    env = GravityEnv(seed=seed, max_steps=max_steps)
-    observation, reset_info = env.reset(seed=seed)
+    seed = _integer(seed, "seed", minimum=-(1 << 63))
+    policy_version = _integer(policy_version, "policy_version", minimum=0)
+    max_steps = _integer(max_steps, "max_steps", minimum=1)
+    if policy_weights is not None and not isinstance(policy_weights, str):
+        raise ValueError("policy_weights must be null or a base64 string")
+    if policy_version == 0 and policy_weights is not None:
+        raise ValueError("policy version 0 requires null weights")
+    if policy_version > 0 and policy_weights is None:
+        raise ValueError("policy version 1 or later requires encoded weights")
 
-    action_iterator = (
-        iter(repeat((0.0, 0.0))) if actions is None else iter(actions)
+    model = (
+        None
+        if policy_weights is None
+        else decode_policy_weights(policy_weights, OBSERVATION_DIM)
     )
-    actions_exhausted = False
-    terminated = False
-    truncated = False
-    final_info: Mapping[str, Any] = reset_info
-    transitions: list[dict[str, Any]] = []
+    generator = make_action_generator(seed, policy_version)
+    env = GravityEnv(
+        seed=seed,
+        max_steps=max_steps * ACTION_HOLD_STEPS,
+    )
+    observation = env.get_observation()
+
+    observations: list[list[float]] = []
+    actions: list[int] = []
+    action_vectors: list[list[float]] = []
+    rewards: list[float] = []
 
     for _ in range(max_steps):
-        try:
-            requested_action = _validate_action(next(action_iterator))
-        except StopIteration:
-            actions_exhausted = True
-            break
-
-        next_observation, reward, terminated, truncated, info = env.step(
-            requested_action
+        observations.append(observation)
+        action_index = (
+            sample_random_action(generator)
+            if model is None
+            else sample_action(model, observation, generator=generator)
         )
-        if "action" not in info:
-            raise RuntimeError(
-                'GravityEnv.step() info must expose its clamped "action"'
-            )
-        applied_action = _validate_action(info["action"])
-
-        transitions.append(
-            {
-                "observation": observation,
-                "requested_action": requested_action,
-                "action": applied_action,
-                "reward": float(reward),
-                "next_observation": next_observation,
-                "terminated": bool(terminated),
-                "truncated": bool(truncated),
-                "info": info,
-            }
+        next_observation, reward, terminated, truncated, _ = env.step_discrete(
+            action_index,
+            hold_steps=ACTION_HOLD_STEPS,
         )
+        actions.append(action_index)
+        action_vectors.append(list(action_index_to_vector(action_index)))
+        rewards.append(float(reward))
         observation = next_observation
-        final_info = info
-
         if terminated or truncated:
             break
 
+    final_info = env.info()
     result = {
+        # A real Daytona caller sets this environment variable. Local execution
+        # leaves it null rather than inventing a sandbox identity.
+        "sandbox_id": sandbox_id or os.environ.get("DAYTONA_SANDBOX_ID"),
         "seed": seed,
-        "steps": len(transitions),
-        "terminated": bool(terminated),
-        "truncated": bool(truncated),
-        "success": bool(final_info.get("success", False)),
-        "actions_exhausted": actions_exhausted,
-        "initial_observation": (
-            transitions[0]["observation"] if transitions else observation
-        ),
+        "policy_version": policy_version,
+        "reward": float(math.fsum(rewards)),
+        "success": env.success,
+        "termination": env.status,
+        "steps": len(actions),
+        "physics_steps": env.timestep,
+        "universe": env.universe_dict(),
+        "trajectory": env.trajectory,
+        "observations": observations,
+        "actions": actions,
+        "action_vectors": action_vectors,
+        "rewards": rewards,
         "final_observation": observation,
-        "reset_info": reset_info,
-        "info": final_info,
-        "transitions": transitions,
+        "min_clearance": env.min_clearance_seen,
+        "fuel_used": env.fuel_used,
+        "mean_speed": final_info["mean_speed"],
+        "max_speed": env.max_speed,
+        "policy_mode": "seeded_random_v0" if model is None else "neural_policy",
     }
     return _json_safe(result)
 
 
 def execute_job(job: Mapping[str, Any]) -> dict[str, Any]:
-    """Execute a small JSON job envelope suitable for a future sandbox call.
+    """Execute the frozen JSON envelope used by Daytona orchestration."""
 
-    Expected shape::
-
-        {"seed": 7, "max_steps": 600, "actions": [[0.0, 1.0], ...]}
-
-    ``actions`` may be omitted to request a zero-thrust rollout.
-    """
     if not isinstance(job, Mapping):
         raise ValueError("job must be a JSON object")
-
     return run_rollout(
-        seed=job.get("seed", 0),
-        actions=job.get("actions"),
+        seed=job.get("seed"),
+        policy_version=job.get("policy_version", 0),
+        policy_weights=job.get("policy_weights"),
         max_steps=job.get("max_steps", DEFAULT_MAX_STEPS),
     )
-
-
-def _validate_action(action: Action) -> list[float]:
-    if isinstance(action, (str, bytes)):
-        raise ValueError("each action must contain exactly two finite numbers")
-    try:
-        if len(action) != 2:
-            raise ValueError
-        values = [float(action[0]), float(action[1])]
-    except (TypeError, ValueError, IndexError) as exc:
-        raise ValueError(
-            "each action must contain exactly two finite numbers"
-        ) from exc
-
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("each action must contain exactly two finite numbers")
-    return values
 
 
 def _json_safe(value: Any) -> Any:
@@ -164,41 +166,49 @@ def _load_json(path: str) -> Any:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a deterministic GravityEnv episode without RL."
+        description="Run one Gravity Gauntlet policy episode."
     )
     parser.add_argument(
         "--job",
         metavar="PATH",
         help='JSON job envelope path, or "-" to read it from stdin',
     )
-    parser.add_argument("--seed", type=int, default=0, help="Universe seed")
+    parser.add_argument("--seed", type=int, default=18473, help="Universe seed")
+    parser.add_argument("--policy-version", type=int, default=0)
+    parser.add_argument("--policy-weights", default=None)
     parser.add_argument(
         "--max-steps",
         type=int,
         default=DEFAULT_MAX_STEPS,
-        help="Maximum number of environment steps",
-    )
-    parser.add_argument(
-        "--actions",
-        metavar="PATH",
-        help='JSON action-list path, or "-" to read it from stdin',
+        help="Maximum number of held policy decisions",
     )
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = _parse_args()
-    if args.job and args.actions:
-        raise SystemExit("use either --job or --actions, not both")
-
-    if args.job:
-        result = execute_job(_load_json(args.job))
-    else:
-        actions = _load_json(args.actions) if args.actions else None
-        result = run_rollout(args.seed, actions, args.max_steps)
-
-    print(json.dumps(result, sort_keys=True, allow_nan=False))
+    try:
+        if args.job:
+            job = _load_json(args.job)
+        else:
+            stdin_payload = "" if sys.stdin.isatty() else sys.stdin.read()
+            job = (
+                json.loads(stdin_payload)
+                if stdin_payload.strip()
+                else {
+                    "seed": args.seed,
+                    "policy_version": args.policy_version,
+                    "policy_weights": args.policy_weights,
+                    "max_steps": args.max_steps,
+                }
+            )
+        result = execute_job(job)
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 0
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        print(f"rollout worker error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
