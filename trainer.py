@@ -31,6 +31,15 @@ DEFAULT_BASE_SEED = 18_473
 
 Rollout = Mapping[str, Any]
 RunGeneration = Callable[..., Awaitable[Sequence[Rollout]] | Sequence[Rollout]]
+GenerationCallback = Callable[
+    [Mapping[str, Any], Sequence[Rollout]],
+    Awaitable[None] | None,
+]
+LifecycleCallback = Callable[[Mapping[str, Any]], Awaitable[None] | None]
+RolloutValidator = Callable[
+    [int, Sequence[int], Sequence[Rollout]],
+    Awaitable[None] | None,
+]
 
 
 class RolloutValidationError(ValueError):
@@ -279,8 +288,19 @@ async def run_daytona_training(
     learning_rate: float = LEARNING_RATE,
     max_grad_norm: float = MAX_GRAD_NORM,
     checkpoint_dir: str | Path = "checkpoints",
+    snapshot_name: str | None = None,
+    keep_sandboxes: bool = False,
+    event_callback: LifecycleCallback | None = None,
+    rollout_validator: RolloutValidator | None = None,
+    on_generation: GenerationCallback | None = None,
 ) -> list[dict[str, Any]]:
-    """Train against real rollouts returned by the Daytona orchestrator only."""
+    """Train against real rollouts returned by the Daytona orchestrator only.
+
+    ``on_generation`` is an integration hook, not a second training pathway.
+    It receives the completed metrics/checkpoint record and the untouched real
+    rollout structures after the policy update, allowing a controller to
+    persist renderer-ready provenance without duplicating this loop.
+    """
 
     generations = _positive_int(generations, "generations")
     worlds = _positive_int(worlds, "worlds")
@@ -319,15 +339,42 @@ async def run_daytona_training(
         policy_weights = (
             None if policy_version == 0 else encode_policy_weights(model)
         )
+        run_kwargs: dict[str, Any] = {
+            "policy_version": policy_version,
+            "policy_weights": policy_weights,
+            "seeds": seeds,
+            "max_steps": max_steps,
+            "keep_sandboxes": bool(keep_sandboxes),
+        }
+        if snapshot_name is not None:
+            run_kwargs["snapshot_name"] = snapshot_name
+        if event_callback is not None:
+            def tagged_event(
+                event: Mapping[str, Any],
+                *,
+                generation: int = policy_version,
+            ) -> Awaitable[None] | None:
+                tagged = dict(event)
+                tagged["generation"] = generation
+                tagged["policy_version"] = generation
+                return event_callback(tagged)
+
+            run_kwargs["event_callback"] = tagged_event
+
         generation_result = run_generation(
-            policy_version=policy_version,
-            policy_weights=policy_weights,
-            seeds=seeds,
-            max_steps=max_steps,
+            **run_kwargs,
         )
         if inspect.isawaitable(generation_result):
             generation_result = await generation_result
         rollouts = _coerce_generation_result(generation_result)
+        if rollout_validator is not None:
+            validation_result = rollout_validator(
+                policy_version,
+                tuple(seeds),
+                tuple(rollouts),
+            )
+            if inspect.isawaitable(validation_result):
+                await validation_result
 
         generation_metrics = summarize_generation(rollouts)
         update_metrics = reinforce_update(
@@ -358,6 +405,10 @@ async def run_daytona_training(
             **update_metrics,
         }
         history.append(record)
+        if on_generation is not None:
+            callback_result = on_generation(dict(record), tuple(rollouts))
+            if inspect.isawaitable(callback_result):
+                await callback_result
         _print_generation(record)
 
     return history
@@ -640,6 +691,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--max-grad-norm", type=float, default=MAX_GRAD_NORM)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--snapshot-name")
+    parser.add_argument("--keep-sandboxes", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -658,9 +711,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 learning_rate=args.learning_rate,
                 max_grad_norm=args.max_grad_norm,
                 checkpoint_dir=args.checkpoint_dir,
+                snapshot_name=args.snapshot_name,
+                keep_sandboxes=args.keep_sandboxes,
             )
         )
-    except (RuntimeError, RolloutValidationError, ValueError) as exc:
+    except (FloatingPointError, RuntimeError, RolloutValidationError, ValueError) as exc:
         raise SystemExit(f"training failed: {exc}") from exc
 
 
@@ -672,9 +727,12 @@ __all__ = [
     "DEFAULT_BASE_SEED",
     "ENTROPY_COEF",
     "GAMMA",
+    "GenerationCallback",
     "LEARNING_RATE",
     "MAX_GRAD_NORM",
+    "LifecycleCallback",
     "RolloutValidationError",
+    "RolloutValidator",
     "compute_reward_to_go",
     "create_optimizer",
     "generation_seeds",

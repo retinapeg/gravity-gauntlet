@@ -1,0 +1,4 @@
+# Headless runtime installed inside each Gravity Gauntlet Daytona snapshot.
+# The host-side Daytona SDK is installed separately and is not needed by workers.
+--index-url https://download.pytorch.org/whl/cpu
+torch>=2.2,<3

@@ -12,7 +12,6 @@ import argparse
 import json
 import math
 import operator
-import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -48,8 +47,6 @@ def run_rollout(
     policy_version: int = 0,
     policy_weights: str | None = None,
     max_steps: int = DEFAULT_MAX_STEPS,
-    *,
-    sandbox_id: str | None = None,
 ) -> dict[str, Any]:
     """Run one complete categorical-policy episode using the shared physics.
 
@@ -104,9 +101,9 @@ def run_rollout(
 
     final_info = env.info()
     result = {
-        # A real Daytona caller sets this environment variable. Local execution
-        # leaves it null rather than inventing a sandbox identity.
-        "sandbox_id": sandbox_id or os.environ.get("DAYTONA_SANDBOX_ID"),
+        # The canonical worker is execution-backend agnostic. Only
+        # daytona_worker_entry.py may inject a verified Daytona sandbox ID.
+        "sandbox_id": None,
         "seed": seed,
         "policy_version": policy_version,
         "reward": float(math.fsum(rewards)),

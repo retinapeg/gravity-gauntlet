@@ -330,7 +330,11 @@ class WorkerTrainingContractTests(unittest.TestCase):
     def test_worker_exposes_aligned_training_sequences_and_local_sandbox_key(
         self,
     ) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(
+            os.environ,
+            {"DAYTONA_SANDBOX_ID": "forged-local-environment-id"},
+            clear=True,
+        ):
             result = execute_job(self._job(None))
 
         self.assertIn("sandbox_id", result)
@@ -409,6 +413,7 @@ class DaytonaTrainingBoundaryTests(unittest.TestCase):
             self.skipTest("rl_policy integration is not available yet")
 
         calls: list[dict[str, object]] = []
+        hook_events: list[str] = []
 
         async def fake_daytona_generation(**kwargs: object) -> list[dict[str, object]]:
             calls.append(kwargs)
@@ -428,6 +433,21 @@ class DaytonaTrainingBoundaryTests(unittest.TestCase):
                 for world_index in range(len(kwargs["seeds"]))
             ]
 
+        def validate_rollouts(
+            policy_version: int,
+            seeds: object,
+            rollouts: object,
+        ) -> None:
+            self.assertEqual(len(seeds), 2)
+            self.assertEqual(len(rollouts), 2)
+            hook_events.append(f"validate-{policy_version}")
+
+        def persist_generation(record: dict[str, object], rollouts: object) -> None:
+            policy_version = int(record["policy_version"])
+            self.assertEqual(len(rollouts), 2)
+            self.assertTrue(Path(record["checkpoint"]).is_file())
+            hook_events.append(f"persist-{policy_version}")
+
         with tempfile.TemporaryDirectory() as temporary_directory:
             output = io.StringIO()
             with (
@@ -446,6 +466,8 @@ class DaytonaTrainingBoundaryTests(unittest.TestCase):
                         obs_dim=3,
                         base_seed=99,
                         checkpoint_dir=temporary_directory,
+                        rollout_validator=validate_rollouts,
+                        on_generation=persist_generation,
                     )
                 )
 
@@ -459,6 +481,10 @@ class DaytonaTrainingBoundaryTests(unittest.TestCase):
             self.assertTrue(calls[1]["policy_weights"])
             self.assertEqual(history[0]["next_policy_version"], 1)
             self.assertEqual(history[1]["next_policy_version"], 2)
+            self.assertEqual(
+                hook_events,
+                ["validate-0", "persist-0", "validate-1", "persist-1"],
+            )
             self.assertTrue((Path(temporary_directory) / "policy_v000.pt").is_file())
             self.assertTrue((Path(temporary_directory) / "policy_v001.pt").is_file())
             self.assertTrue((Path(temporary_directory) / "policy_v002.pt").is_file())
