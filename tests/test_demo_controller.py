@@ -25,6 +25,7 @@ from gravity_gauntlet.demo_controller import (
     IntegrationComponents,
     IntegrationContractError,
     LifecycleCollector,
+    LiveStateTracker,
     build_generation_state,
     checkpoint_model_digest,
     coerce_generation_results,
@@ -631,7 +632,13 @@ class FixtureBoundaryTests(unittest.TestCase):
                     "checkpoint": str(checkpoint),
                     "worlds": len(results),
                     "episodes": len(results),
+                    "transitions": sum(len(result["actions"]) for result in results),
                     "loss": 0.25,
+                    "entropy": 0.5,
+                    "parameter_l2_delta": 0.125,
+                    "changed_parameter_tensors": 1,
+                    "changed_parameter_elements": 1,
+                    "weights_changed": True,
                 }
                 persisted = kwargs["on_generation"](record, results)
                 if asyncio.iscoroutine(persisted):
@@ -702,6 +709,138 @@ class FixtureBoundaryTests(unittest.TestCase):
             },
         )
         self.assertTrue(all(world["actions"] for world in payload["worlds"]))
+
+    def test_live_state_has_real_phase_trace_metrics_and_artifact_path(self) -> None:
+        events: list[str] = []
+        components = self._components(events)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_path = root / "runs" / "live_state.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                asyncio.run(
+                    run_training_demo(
+                        generations=1,
+                        worlds=2,
+                        max_steps=5,
+                        base_seed=900,
+                        obs_dim=2,
+                        runs_dir=root / "runs",
+                        checkpoint_dir=root / "checkpoints",
+                        live_state_path=live_path,
+                        invocation_id="fixture-invocation",
+                        components=components,
+                        echo_lifecycle=False,
+                    )
+                )
+            state = json.loads(live_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(state["invocation_id"], "fixture-invocation")
+        self.assertEqual(state["execution_backend"], "fixture")
+        self.assertEqual(state["phase"], "GENERATION_COMPLETE")
+        self.assertEqual(state["generation"], 0)
+        self.assertEqual(state["policy_version_used"], 0)
+        self.assertEqual(state["next_policy_version"], 1)
+        self.assertEqual(state["worlds_requested"], 2)
+        self.assertEqual(state["worlds_collected"], 2)
+        self.assertEqual(state["completed_generations"], 1)
+        self.assertTrue(state["ready_for_next_generation"])
+        self.assertEqual(
+            state["generation_path"],
+            str(root / "runs" / "generation_000.json"),
+        )
+        self.assertEqual(state["training"]["episodes"], 2)
+        self.assertEqual(state["training"]["transitions"], 4)
+        self.assertEqual(state["training"]["changed_tensors"], 1)
+        self.assertEqual(state["training"]["changed_elements"], 1)
+        self.assertTrue(state["training"]["weights_changed"])
+        self.assertTrue(state["policy_update"]["weights_changed"])
+        self.assertEqual(
+            [entry["phase"] for entry in state["phase_history"]],
+            [
+                "READY",
+                "FREEZING_POLICY",
+                "CREATING_DAYTONA_WORLDS",
+                "RUNNING_DAYTONA",
+                "COLLECTING_EXPERIENCES",
+                "TRAINING_POLICY",
+                "POLICY_UPDATED",
+                "GENERATION_COMPLETE",
+            ],
+        )
+        self.assertEqual(
+            [world["sandbox_id"] for world in state["worlds"]],
+            ["fixture-boundary-0-1", "fixture-boundary-0-2"],
+        )
+
+    def test_live_state_result_count_is_unique_and_identity_conflicts_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live_state.json"
+            tracker = LiveStateTracker(
+                path=path,
+                invocation_id="fixture-unique-results",
+                execution_backend="fixture",
+                generations=1,
+                worlds=2,
+                max_steps=5,
+                start_generation=0,
+                policy_version=0,
+            )
+            tracker.prepare_generation(0, 0)
+            base = {
+                "generation": 0,
+                "policy_version": 0,
+                "world": 1,
+                "seed": 123,
+                "sandbox_id": "fixture-world-1",
+            }
+            tracker.lifecycle_event({**base, "state": "LIVE"})
+            tracker.lifecycle_event(
+                {**base, "state": "RESULT_COLLECTED", "reward": 1.25}
+            )
+            tracker.lifecycle_event(
+                {**base, "state": "RESULT_COLLECTED", "reward": 1.25}
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["experiences_collected"], 1)
+            self.assertEqual(payload["worlds_collected"], 1)
+            with self.assertRaisesRegex(
+                IntegrationContractError,
+                "conflicting sandbox_id",
+            ):
+                tracker.lifecycle_event(
+                    {**base, "state": "RUNNING", "sandbox_id": "different-id"}
+                )
+
+    def test_failed_generation_publishes_error_without_policy_advance(self) -> None:
+        events: list[str] = []
+        components = self._components(events, fail_daytona=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live_path = root / "runs" / "live_state.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(IntegrationContractError):
+                    asyncio.run(
+                        run_training_demo(
+                            generations=1,
+                            worlds=2,
+                            max_steps=5,
+                            obs_dim=2,
+                            runs_dir=root / "runs",
+                            checkpoint_dir=root / "checkpoints",
+                            live_state_path=live_path,
+                            components=components,
+                            echo_lifecycle=False,
+                        )
+                    )
+            state = json.loads(live_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(state["phase"], "ERROR")
+        self.assertEqual(state["policy_version_used"], 0)
+        self.assertIsNone(state["next_policy_version"])
+        self.assertIsNone(state["generation_path"])
+        self.assertIsNone(state["latest_valid"])
+        self.assertFalse(state["ready_for_next_generation"])
+        self.assertIn("no local rollout fallback", state["error"]["message"])
 
     def test_unchanged_policy_weights_are_not_renamed_or_persisted(self) -> None:
         events: list[str] = []

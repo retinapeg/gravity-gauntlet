@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 import math
 import os
 from pathlib import Path
 import random
-from typing import Any
+import subprocess
+import sys
+import time
+from typing import Any, Callable, Mapping, Sequence
+import uuid
 
 from gravity_env import ACTION_HOLD_STEPS, GravityEnv
 
@@ -32,6 +36,59 @@ FPS = 60
 TRAIL_LENGTH = 650
 REPLAY_TARGET_SECONDS = 8.0
 REPLAY_END_HOLD_SECONDS = 2.8
+DEFAULT_LIVE_SNAPSHOT_NAME = "gravity-gauntlet-worker-v2"
+DEFAULT_LIVE_WORLDS = 8
+DEFAULT_LIVE_MAX_STEPS = 500
+DEFAULT_LIVE_BASE_SEED = 18_473
+DEFAULT_LIVE_RUNS_DIR = Path("runs")
+DEFAULT_LIVE_CHECKPOINT_DIR = Path("checkpoints")
+LIVE_STATE_SCHEMA_VERSION = 1
+LIVE_STATE_POLL_SECONDS = 0.15
+LIVE_STATE_FILENAME = "live_state.json"
+LIVE_CONTROLLER_MODULE = "src.gravity_gauntlet.demo_controller"
+LIVE_TRAINING_PHASES = (
+    "READY",
+    "FREEZING_POLICY",
+    "CREATING_DAYTONA_WORLDS",
+    "RUNNING_DAYTONA",
+    "COLLECTING_EXPERIENCES",
+    "TRAINING_POLICY",
+    "POLICY_UPDATED",
+    "LAUNCHING_NEXT_GENERATION",
+    "GENERATION_COMPLETE",
+    "ERROR",
+)
+LIVE_WORLD_STATES = {
+    "CREATING",
+    "LIVE",
+    "RUNNING",
+    "SUCCESS",
+    "COLLISION",
+    "OUT_OF_BOUNDS",
+    "TIMEOUT",
+    "RESULT_COLLECTED",
+    "ERROR",
+}
+LIVE_TERMINAL_PHASES = {"GENERATION_COMPLETE", "ERROR"}
+LIVE_TRAINER_METRICS = {
+    "episodes",
+    "transitions",
+    "loss",
+    "policy_loss",
+    "entropy",
+    "gradient_norm",
+    "parameter_l2_delta",
+    "parameter_max_abs_delta",
+    "changed_parameter_tensors",
+    "changed_parameter_elements",
+    "changed_tensors",
+    "changed_elements",
+    "weights_changed",
+    "mean_reward_to_go",
+    "std_reward_to_go",
+    "advantage_mean",
+    "advantage_std",
+}
 
 # Preserve the 1200:800 simulation aspect ratio while reserving a fixed right
 # column for eight judge-facing universe cards.  This is a rendering transform
@@ -96,6 +153,67 @@ class AttemptTrail:
     is_champion: bool = False
     champion_declared: bool = False
     source_file: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveTrainingConfig:
+    """UI-owned launch settings for one controller generation at a time."""
+
+    repo_root: Path
+    snapshot_name: str
+    worlds: int
+    max_steps: int
+    runs_dir: Path
+    checkpoint_dir: Path
+    live_state_path: Path
+    base_seed: int
+    start_generation: int = 0
+    policy_version: int = 0
+    start_checkpoint: Path | None = None
+
+
+@dataclass(frozen=True)
+class LiveWorldSnapshot:
+    """One real world entry from the controller's atomic live-state file."""
+
+    world_index: int
+    seed: int | None
+    sandbox_id: str | None
+    lifecycle_state: str | None
+    reward: float | None
+    success: bool | None
+    termination: str | None
+    result_collected: bool
+    error: str | None
+    lifecycle: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class LiveStateSnapshot:
+    """Strict, correlation-safe view of genuine controller progress."""
+
+    invocation_id: str
+    revision: int
+    phase: str
+    generation: int
+    policy_version_used: int
+    next_generation: int | None
+    next_policy_version: int | None
+    worlds_expected: int
+    sandboxes_live: int
+    experiences_collected: int
+    worlds: tuple[LiveWorldSnapshot, ...]
+    trainer_metrics: dict[str, Any] | None
+    policy_update: dict[str, Any] | None
+    generation_json: str | None
+    latest_valid: dict[str, Any] | None
+    completed_generations: int
+    ready_for_next_generation: bool
+    interrupted: bool
+    error: dict[str, Any] | None
+    message: str
+    phase_history: tuple[dict[str, Any], ...]
+    updated_at: str
 
 
 def _finite_number(value: Any, label: str) -> float:
@@ -905,6 +1023,792 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
             champion_index = max(scored, key=lambda item: float(attempts[item].reward))
             attempts[champion_index] = replace(attempts[champion_index], is_champion=True)
     return attempts
+
+
+def _json_integer(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        qualifier = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(f"{label} must be a {qualifier} JSON integer")
+    return value
+
+
+def _json_boolean(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a JSON boolean")
+    return value
+
+
+def _optional_live_text(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be non-empty text when present")
+    return value
+
+
+def _optional_live_integer(value: Any, label: str) -> int | None:
+    return None if value is None else _json_integer(value, label)
+
+
+def _live_lifecycle_sequence(states: Sequence[str], label: str) -> None:
+    """Require a real lifecycle prefix, with ERROR allowed only as the last event."""
+
+    remaining = list(states)
+    if remaining and remaining[-1] == "ERROR":
+        remaining.pop()
+    elif "ERROR" in remaining:
+        raise ValueError(f"{label} ERROR must be the final lifecycle event")
+    if not remaining:
+        return
+    if len(remaining) > 5:
+        raise ValueError(f"{label} contains too many lifecycle events")
+    if remaining[0] != "CREATING":
+        raise ValueError(f"{label} must begin with CREATING")
+    if len(remaining) >= 2 and remaining[1] != "LIVE":
+        raise ValueError(f"{label} must progress from CREATING to LIVE")
+    if len(remaining) >= 3 and remaining[2] != "RUNNING":
+        raise ValueError(f"{label} must progress from LIVE to RUNNING")
+    if len(remaining) >= 4 and remaining[3] not in TERMINAL_LIFECYCLE_STATES:
+        raise ValueError(f"{label} needs a real terminal outcome after RUNNING")
+    if len(remaining) >= 5 and remaining[4] != "RESULT_COLLECTED":
+        raise ValueError(f"{label} must finish with RESULT_COLLECTED")
+
+
+def _validate_live_world(
+    raw: Any,
+    *,
+    generation: int,
+    policy_version: int,
+    expected_index: int,
+) -> LiveWorldSnapshot:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"live world {expected_index} must be a JSON object")
+    world_index = _json_integer(
+        raw.get("world_index"), f"live world {expected_index} world_index", minimum=1
+    )
+    if world_index != expected_index:
+        raise ValueError(
+            f"live world index {world_index} does not match slot {expected_index}"
+        )
+    seed = _optional_live_integer(raw.get("seed"), f"live world {world_index} seed")
+    sandbox_id = _optional_live_text(
+        raw.get("sandbox_id"), f"live world {world_index} sandbox_id"
+    )
+    if sandbox_id is not None and _synthetic_sandbox_id(sandbox_id):
+        raise ValueError(f"live world {world_index} has a synthetic sandbox ID")
+    lifecycle_state = _optional_live_text(
+        raw.get("lifecycle_state"), f"live world {world_index} lifecycle_state"
+    )
+    if lifecycle_state is not None:
+        lifecycle_state = lifecycle_state.upper()
+        if lifecycle_state not in LIVE_WORLD_STATES:
+            raise ValueError(
+                f"live world {world_index} has unknown state {lifecycle_state}"
+            )
+    reward = _optional_number(raw.get("reward"), f"live world {world_index} reward")
+    success = raw.get("success")
+    if success is not None and not isinstance(success, bool):
+        raise ValueError(f"live world {world_index} success must be a JSON boolean")
+    termination = _optional_live_text(
+        raw.get("termination"), f"live world {world_index} termination"
+    )
+    result_collected = _json_boolean(
+        raw.get("result_collected"), f"live world {world_index} result_collected"
+    )
+    error = _optional_live_text(raw.get("error"), f"live world {world_index} error")
+    raw_lifecycle = raw.get("lifecycle")
+    if not isinstance(raw_lifecycle, list):
+        raise ValueError(f"live world {world_index} lifecycle must be a list")
+
+    lifecycle: list[dict[str, Any]] = []
+    states: list[str] = []
+    event_sandbox_id: str | None = None
+    event_seed: int | None = None
+    event_reward: float | None = None
+    for event_index, event in enumerate(raw_lifecycle):
+        if not isinstance(event, Mapping):
+            raise ValueError(
+                f"live world {world_index} lifecycle event {event_index} must be an object"
+            )
+        event_generation = _json_integer(
+            event.get("generation"),
+            f"live world {world_index} lifecycle generation",
+        )
+        event_policy = _json_integer(
+            event.get("policy_version"),
+            f"live world {world_index} lifecycle policy_version",
+        )
+        event_world = _json_integer(
+            event.get("world"), f"live world {world_index} lifecycle world", minimum=1
+        )
+        if (
+            event_generation != generation
+            or event_policy != policy_version
+            or event_world != world_index
+        ):
+            raise ValueError(
+                f"live world {world_index} lifecycle identity does not match the active run"
+            )
+        current_seed = _json_integer(
+            event.get("seed"), f"live world {world_index} lifecycle seed"
+        )
+        if event_seed is not None and current_seed != event_seed:
+            raise ValueError(f"live world {world_index} lifecycle seed changed")
+        event_seed = current_seed
+        state = _optional_live_text(
+            event.get("state"), f"live world {world_index} lifecycle state"
+        )
+        assert state is not None
+        state = state.upper()
+        if state not in LIVE_WORLD_STATES:
+            raise ValueError(f"live world {world_index} has unknown lifecycle state {state}")
+        states.append(state)
+        current_sandbox = _optional_live_text(
+            event.get("sandbox_id"),
+            f"live world {world_index} lifecycle sandbox_id",
+        )
+        if current_sandbox is not None and _synthetic_sandbox_id(current_sandbox):
+            raise ValueError(f"live world {world_index} lifecycle has a synthetic ID")
+        if state == "CREATING" and current_sandbox is not None:
+            raise ValueError(f"live world {world_index} CREATING cannot claim an ID")
+        if state not in {"CREATING", "ERROR"} and current_sandbox is None:
+            raise ValueError(f"live world {world_index} {state} requires its real ID")
+        if current_sandbox is not None:
+            if event_sandbox_id is not None and current_sandbox != event_sandbox_id:
+                raise ValueError(f"live world {world_index} lifecycle sandbox ID changed")
+            event_sandbox_id = current_sandbox
+        if event.get("reward") is not None:
+            event_reward = _finite_number(
+                event["reward"], f"live world {world_index} lifecycle reward"
+            )
+        lifecycle.append(dict(event))
+
+    _live_lifecycle_sequence(states, f"live world {world_index} lifecycle")
+    if lifecycle:
+        if lifecycle_state != states[-1]:
+            raise ValueError(
+                f"live world {world_index} current state does not match its lifecycle"
+            )
+        if seed != event_seed:
+            raise ValueError(f"live world {world_index} seed does not match its lifecycle")
+        if sandbox_id != event_sandbox_id:
+            raise ValueError(
+                f"live world {world_index} sandbox ID does not match its lifecycle"
+            )
+    elif lifecycle_state is not None or seed is not None or sandbox_id is not None:
+        raise ValueError(
+            f"live world {world_index} cannot claim progress without lifecycle evidence"
+        )
+    collected_in_lifecycle = "RESULT_COLLECTED" in states
+    if result_collected != collected_in_lifecycle:
+        raise ValueError(
+            f"live world {world_index} result_collected disagrees with its lifecycle"
+        )
+    if reward is not None and event_reward is not None and not math.isclose(
+        reward, event_reward, rel_tol=1.0e-12, abs_tol=1.0e-9
+    ):
+        raise ValueError(f"live world {world_index} reward changed across lifecycle fields")
+    if success is not None and termination is not None:
+        if success != (termination.lower() == "success"):
+            raise ValueError(
+                f"live world {world_index} success and termination disagree"
+            )
+    if lifecycle_state == "ERROR" and error is None:
+        raise ValueError(f"live world {world_index} ERROR requires a real error message")
+    return LiveWorldSnapshot(
+        world_index=world_index,
+        seed=seed,
+        sandbox_id=sandbox_id,
+        lifecycle_state=lifecycle_state,
+        reward=reward,
+        success=success,
+        termination=termination,
+        result_collected=result_collected,
+        error=error,
+        lifecycle=tuple(lifecycle),
+    )
+
+
+def _validate_live_metrics(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("live trainer_metrics must be a JSON object")
+    metrics: dict[str, Any] = {}
+    integer_metrics = {
+        "episodes",
+        "transitions",
+        "changed_parameter_tensors",
+        "changed_parameter_elements",
+        "changed_tensors",
+        "changed_elements",
+    }
+    for key in LIVE_TRAINER_METRICS:
+        if key not in raw:
+            continue
+        if key == "weights_changed":
+            metrics[key] = _json_boolean(raw[key], f"trainer_metrics.{key}")
+        elif key in integer_metrics:
+            metrics[key] = _json_integer(raw[key], f"trainer_metrics.{key}")
+        else:
+            metrics[key] = _finite_number(raw[key], f"trainer_metrics.{key}")
+    for alias, canonical in (
+        ("changed_tensors", "changed_parameter_tensors"),
+        ("changed_elements", "changed_parameter_elements"),
+    ):
+        if alias in metrics and canonical in metrics and metrics[alias] != metrics[canonical]:
+            raise ValueError(f"trainer_metrics.{alias} disagrees with {canonical}")
+    return metrics
+
+
+def _validate_live_policy_update(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("live policy_update must be a JSON object")
+    required = {
+        "input_checkpoint",
+        "input_model_sha256",
+        "next_checkpoint",
+        "next_model_sha256",
+        "weights_changed",
+    }
+    if not required.issubset(raw):
+        missing = ", ".join(sorted(required.difference(raw)))
+        raise ValueError(f"live policy_update is missing {missing}")
+    update = {key: raw[key] for key in required}
+    for key in ("input_checkpoint", "next_checkpoint"):
+        _optional_live_text(update[key], f"policy_update.{key}")
+    for key in ("input_model_sha256", "next_model_sha256"):
+        digest = _optional_live_text(update[key], f"policy_update.{key}")
+        assert digest is not None
+        if (
+            len(digest) != 64
+            or digest != digest.lower()
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"policy_update.{key} must be a lowercase SHA-256 digest")
+    if update["input_model_sha256"] == update["next_model_sha256"]:
+        raise ValueError("live policy update has identical model-state digests")
+    _json_boolean(update["weights_changed"], "policy_update.weights_changed")
+    return update
+
+
+def _validate_live_state(
+    payload: Any,
+    *,
+    expected_invocation_id: str,
+    expected_generation: int,
+    expected_policy_version: int,
+    expected_worlds: int,
+    expected_max_steps: int,
+    last_revision: int = -1,
+) -> LiveStateSnapshot | None:
+    """Validate one atomic controller snapshot; stale invocations are ignored."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("live state must be a JSON object")
+    invocation_id = payload.get("invocation_id")
+    if not isinstance(invocation_id, str) or not invocation_id:
+        raise ValueError("live state invocation_id must be non-empty text")
+    if invocation_id != expected_invocation_id:
+        return None
+    revision = _json_integer(payload.get("revision"), "live state revision", minimum=1)
+    if revision <= last_revision:
+        return None
+    if payload.get("schema_version") != LIVE_STATE_SCHEMA_VERSION:
+        raise ValueError("unsupported live-state schema_version")
+    if payload.get("mode") != "live_daytona_training":
+        raise ValueError("live state mode is not live_daytona_training")
+    if payload.get("execution_backend") != "daytona":
+        raise ValueError("live state does not identify the Daytona backend")
+    if _json_integer(payload.get("requested_generations"), "requested_generations", minimum=1) != 1:
+        raise ValueError("one R press must request exactly one generation")
+    if _json_integer(payload.get("requested_worlds"), "requested_worlds", minimum=1) != expected_worlds:
+        raise ValueError("live state requested_worlds does not match the UI launch")
+    if _json_integer(payload.get("max_steps"), "max_steps", minimum=1) != expected_max_steps:
+        raise ValueError("live state max_steps does not match the UI launch")
+    generation = _json_integer(payload.get("generation"), "live state generation")
+    policy_version = _json_integer(
+        payload.get("policy_version_used"), "live state policy_version_used"
+    )
+    if generation != expected_generation or policy_version != expected_policy_version:
+        raise ValueError("live state generation/policy does not match the frozen launch")
+    if generation != policy_version:
+        raise ValueError("canonical live generation must equal its frozen policy version")
+    phase = _optional_live_text(payload.get("phase"), "live state phase")
+    assert phase is not None
+    phase = phase.upper()
+    if phase not in LIVE_TRAINING_PHASES:
+        raise ValueError(f"unknown live-training phase {phase}")
+    worlds_expected = _json_integer(
+        payload.get("worlds_expected"), "worlds_expected", minimum=1
+    )
+    if worlds_expected != expected_worlds:
+        raise ValueError("live state worlds_expected does not match the launch")
+    sandboxes_live = _json_integer(payload.get("sandboxes_live"), "sandboxes_live")
+    experiences_collected = _json_integer(
+        payload.get("experiences_collected"), "experiences_collected"
+    )
+    if sandboxes_live > worlds_expected or experiences_collected > worlds_expected:
+        raise ValueError("live world progress exceeds the requested world count")
+
+    raw_worlds = payload.get("worlds")
+    if not isinstance(raw_worlds, list):
+        raise ValueError("live state worlds must be a list")
+    if phase == "READY" and not raw_worlds:
+        worlds: tuple[LiveWorldSnapshot, ...] = ()
+    else:
+        if len(raw_worlds) != worlds_expected:
+            raise ValueError("live state must retain one slot per requested world")
+        worlds = tuple(
+            _validate_live_world(
+                raw,
+                generation=generation,
+                policy_version=policy_version,
+                expected_index=index,
+            )
+            for index, raw in enumerate(raw_worlds, start=1)
+        )
+        seeds = [world.seed for world in worlds if world.seed is not None]
+        ids = [world.sandbox_id for world in worlds if world.sandbox_id is not None]
+        if len(seeds) != len(set(seeds)):
+            raise ValueError("live worlds contain duplicate universe seeds")
+        if len(ids) != len(set(ids)):
+            raise ValueError("live worlds contain duplicate sandbox IDs")
+        if sandboxes_live != len(ids):
+            raise ValueError("sandboxes_live does not match real sandbox identities")
+        if experiences_collected != sum(world.result_collected for world in worlds):
+            raise ValueError("experiences_collected does not match world lifecycle evidence")
+
+    next_generation = _optional_live_integer(
+        payload.get("next_generation"), "next_generation"
+    )
+    next_policy_version = _optional_live_integer(
+        payload.get("next_policy_version"), "next_policy_version"
+    )
+    trainer_metrics = _validate_live_metrics(payload.get("trainer_metrics"))
+    policy_update = _validate_live_policy_update(payload.get("policy_update"))
+    generation_json = _optional_live_text(
+        payload.get("generation_json"), "generation_json"
+    )
+    latest_valid_raw = payload.get("latest_valid")
+    if latest_valid_raw is not None and not isinstance(latest_valid_raw, Mapping):
+        raise ValueError("latest_valid must be a JSON object when present")
+    latest_valid = None if latest_valid_raw is None else dict(latest_valid_raw)
+    completed_generations = _json_integer(
+        payload.get("completed_generations"), "completed_generations"
+    )
+    ready_for_next = _json_boolean(
+        payload.get("ready_for_next_generation"), "ready_for_next_generation"
+    )
+    interrupted = _json_boolean(payload.get("interrupted"), "interrupted")
+    error_raw = payload.get("error")
+    if error_raw is not None and not isinstance(error_raw, Mapping):
+        raise ValueError("live state error must be a JSON object when present")
+    error = None if error_raw is None else dict(error_raw)
+    message = _optional_live_text(payload.get("message"), "live state message")
+    assert message is not None
+    updated_at = _optional_live_text(payload.get("updated_at"), "live state updated_at")
+    assert updated_at is not None
+
+    raw_history = payload.get("phase_history")
+    if not isinstance(raw_history, list) or not raw_history:
+        raise ValueError("live state phase_history must retain real controller transitions")
+    history: list[dict[str, Any]] = []
+    previous_history_revision = 0
+    for index, item in enumerate(raw_history):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"phase_history[{index}] must be a JSON object")
+        history_revision = _json_integer(
+            item.get("revision"), f"phase_history[{index}].revision", minimum=1
+        )
+        history_phase = _optional_live_text(
+            item.get("phase"), f"phase_history[{index}].phase"
+        )
+        assert history_phase is not None
+        history_phase = history_phase.upper()
+        if history_phase not in LIVE_TRAINING_PHASES:
+            raise ValueError(f"phase_history[{index}] has an unknown phase")
+        if history_revision <= previous_history_revision or history_revision > revision:
+            raise ValueError("phase_history revisions must be increasing and current")
+        if _json_integer(item.get("generation"), f"phase_history[{index}].generation") != generation:
+            raise ValueError("phase_history generation changed within one invocation")
+        if _json_integer(
+            item.get("policy_version_used"),
+            f"phase_history[{index}].policy_version_used",
+        ) != policy_version:
+            raise ValueError("phase_history policy changed within one frozen generation")
+        previous_history_revision = history_revision
+        normalized_item = dict(item)
+        normalized_item["phase"] = history_phase
+        history.append(normalized_item)
+
+    if phase in {"POLICY_UPDATED", "GENERATION_COMPLETE"}:
+        if (
+            next_generation != generation + 1
+            or next_policy_version != policy_version + 1
+        ):
+            raise ValueError("completed live policy must advance exactly one version")
+        if experiences_collected != worlds_expected:
+            raise ValueError("policy update cannot precede all collected experiences")
+        if trainer_metrics is None or trainer_metrics.get("weights_changed") is not True:
+            raise ValueError("live trainer did not prove changed weights")
+        if policy_update is None or policy_update.get("weights_changed") is not True:
+            raise ValueError("live checkpoint proof did not prove changed weights")
+        if generation_json is None or latest_valid is None:
+            raise ValueError("updated live state must name its exact persisted generation")
+    if phase == "GENERATION_COMPLETE":
+        if completed_generations != 1 or not ready_for_next:
+            raise ValueError("terminal live generation is not marked ready for the next R press")
+    elif phase != "READY" and ready_for_next:
+        raise ValueError("live state unlocked R before terminal success")
+    if phase == "ERROR":
+        if error is None or ready_for_next:
+            raise ValueError("failed live state must carry an error and remain unready")
+    elif error is not None:
+        raise ValueError("non-error live state cannot carry a controller error")
+
+    return LiveStateSnapshot(
+        invocation_id=invocation_id,
+        revision=revision,
+        phase=phase,
+        generation=generation,
+        policy_version_used=policy_version,
+        next_generation=next_generation,
+        next_policy_version=next_policy_version,
+        worlds_expected=worlds_expected,
+        sandboxes_live=sandboxes_live,
+        experiences_collected=experiences_collected,
+        worlds=worlds,
+        trainer_metrics=trainer_metrics,
+        policy_update=policy_update,
+        generation_json=generation_json,
+        latest_valid=latest_valid,
+        completed_generations=completed_generations,
+        ready_for_next_generation=ready_for_next,
+        interrupted=interrupted,
+        error=error,
+        message=message,
+        phase_history=tuple(history),
+        updated_at=updated_at,
+    )
+
+
+def _read_live_state(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _resolve_live_path(path: str | Path, *, repo_root: Path) -> Path:
+    candidate = Path(path)
+    return (candidate if candidate.is_absolute() else repo_root / candidate).resolve()
+
+
+def _path_is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def _load_completed_live_generation(
+    state: LiveStateSnapshot,
+    config: LiveTrainingConfig,
+) -> tuple[list[AttemptTrail], Path]:
+    """Strictly load the exact terminal artifact before any visible data swap."""
+
+    if state.phase != "GENERATION_COMPLETE" or not state.ready_for_next_generation:
+        raise ValueError("live generation is not terminal and ready")
+    assert state.generation_json is not None
+    generation_path = _resolve_live_path(state.generation_json, repo_root=config.repo_root)
+    runs_dir = config.runs_dir.resolve()
+    if not _path_is_within(generation_path, runs_dir):
+        raise ValueError("completed generation JSON is outside the configured runs directory")
+    expected_name = f"generation_{state.generation:03d}.json"
+    if generation_path.name != expected_name:
+        raise ValueError(
+            f"completed generation path must identify {expected_name}, not {generation_path.name}"
+        )
+
+    attempts = load_rollout_trails(generation_path)
+    if len(attempts) != state.worlds_expected:
+        raise ValueError("completed generation world count differs from live state")
+    if not attempts or not all(attempt.daytona_verified for attempt in attempts):
+        raise ValueError("completed live artifact failed strict Daytona provenance checks")
+    if any(
+        attempt.generation != state.generation
+        or attempt.policy_version != state.policy_version_used
+        or attempt.next_policy_version != state.next_policy_version
+        for attempt in attempts
+    ):
+        raise ValueError("completed artifact identity differs from the live frozen policy")
+    _validated_replay_environments(attempts)
+
+    with generation_path.open("r", encoding="utf-8") as handle:
+        generation_payload = json.load(handle)
+    extra = generation_payload.get("extra")
+    if not isinstance(extra, Mapping):
+        raise ValueError("completed generation is missing its training proof")
+    artifact_metrics = extra.get("training")
+    artifact_update = extra.get("policy_update")
+    if not isinstance(artifact_metrics, Mapping) or not isinstance(artifact_update, Mapping):
+        raise ValueError("completed generation is missing trainer/checkpoint proof")
+    assert state.trainer_metrics is not None
+    assert state.policy_update is not None
+    for key, value in state.trainer_metrics.items():
+        canonical = {
+            "changed_tensors": "changed_parameter_tensors",
+            "changed_elements": "changed_parameter_elements",
+        }.get(key, key)
+        if artifact_metrics.get(canonical) != value:
+            raise ValueError(f"live trainer metric {key} differs from the generation artifact")
+    for key, value in state.policy_update.items():
+        if artifact_update.get(key) != value:
+            raise ValueError(f"live policy update field {key} differs from the artifact")
+
+    next_policy = state.next_policy_version
+    assert next_policy is not None
+    checkpoint_value = state.policy_update["next_checkpoint"]
+    checkpoint_path = _resolve_live_path(checkpoint_value, repo_root=config.repo_root)
+    if not _path_is_within(checkpoint_path, config.checkpoint_dir.resolve()):
+        raise ValueError("next policy checkpoint is outside the configured checkpoint directory")
+    if checkpoint_path.name != f"policy_v{next_policy:03d}.pt":
+        raise ValueError("next checkpoint filename does not match the advanced policy version")
+    if not checkpoint_path.is_file():
+        raise ValueError("verified next policy checkpoint is missing from disk")
+    latest = state.latest_valid
+    assert latest is not None
+    expected_latest = {
+        "generation": state.generation,
+        "policy_version_used": state.policy_version_used,
+        "next_policy_version": next_policy,
+        "generation_json": state.generation_json,
+        "checkpoint": checkpoint_value,
+        "checkpoint_model_sha256": state.policy_update["next_model_sha256"],
+    }
+    if any(latest.get(key) != value for key, value in expected_latest.items()):
+        raise ValueError("latest_valid does not bind the completed generation/checkpoint")
+    return attempts, checkpoint_path
+
+
+def _live_controller_argv(
+    config: LiveTrainingConfig,
+    invocation_id: str,
+    *,
+    generation: int,
+    policy_version: int,
+    checkpoint: Path | None,
+) -> list[str]:
+    """Build one shell-free GRAV 3 invocation; the environment is inherited."""
+
+    argv = [
+        sys.executable,
+        "-m",
+        LIVE_CONTROLLER_MODULE,
+        "--generations",
+        "1",
+        "--worlds",
+        str(config.worlds),
+        "--max-steps",
+        str(config.max_steps),
+        "--base-seed",
+        str(config.base_seed),
+        "--runs-dir",
+        str(config.runs_dir),
+        "--checkpoint-dir",
+        str(config.checkpoint_dir),
+        "--snapshot-name",
+        config.snapshot_name,
+        "--live-state-path",
+        str(config.live_state_path),
+        "--invocation-id",
+        invocation_id,
+        "--start-generation",
+        str(generation),
+        "--initial-policy-version",
+        str(policy_version),
+    ]
+    if checkpoint is not None:
+        argv.extend(("--policy-checkpoint", str(checkpoint)))
+    return argv
+
+
+@dataclass
+class LiveTrainingSession:
+    """Nonblocking process/poll state for the judge-facing live window."""
+
+    config: LiveTrainingConfig
+    process: Any | None = field(default=None, init=False)
+    invocation_id: str | None = field(default=None, init=False)
+    state: LiveStateSnapshot | None = field(default=None, init=False)
+    last_revision: int = field(default=-1, init=False)
+    next_poll_at: float = field(default=0.0, init=False)
+    current_generation: int = field(init=False)
+    current_policy_version: int = field(init=False)
+    current_checkpoint: Path | None = field(init=False)
+    error: str | None = field(default=None, init=False)
+    warning: str | None = field(default=None, init=False)
+    locked_notice: bool = field(default=False, init=False)
+    _completed: tuple[list[AttemptTrail], Path] | None = field(default=None, init=False)
+    _seen_phase_revision: int = field(default=0, init=False)
+    _phase_queue: deque[str] = field(default_factory=deque, init=False)
+    _display_phase: str | None = field(default=None, init=False)
+    _display_phase_until: float = field(default=0.0, init=False)
+
+    def __post_init__(self) -> None:
+        self.current_generation = self.config.start_generation
+        self.current_policy_version = self.config.policy_version
+        self.current_checkpoint = self.config.start_checkpoint
+
+    @property
+    def active(self) -> bool:
+        return self.process is not None
+
+    def request_generation(
+        self,
+        *,
+        popen_factory: Callable[..., Any] | None = None,
+    ) -> bool:
+        if self.active:
+            self.locked_notice = True
+            return False
+        invocation_id = uuid.uuid4().hex
+        argv = _live_controller_argv(
+            self.config,
+            invocation_id,
+            generation=self.current_generation,
+            policy_version=self.current_policy_version,
+            checkpoint=self.current_checkpoint,
+        )
+        launcher = subprocess.Popen if popen_factory is None else popen_factory
+        self.process = launcher(
+            argv,
+            cwd=str(self.config.repo_root),
+            shell=False,
+        )
+        self.invocation_id = invocation_id
+        self.state = None
+        self.last_revision = -1
+        self.next_poll_at = 0.0
+        self.error = None
+        self.warning = None
+        self.locked_notice = False
+        self._completed = None
+        self._seen_phase_revision = 0
+        self._phase_queue.clear()
+        self._display_phase = "READY"
+        self._display_phase_until = 0.0
+        return True
+
+    def _accept_state(self, payload: Any) -> None:
+        assert self.invocation_id is not None
+        snapshot = _validate_live_state(
+            payload,
+            expected_invocation_id=self.invocation_id,
+            expected_generation=self.current_generation,
+            expected_policy_version=self.current_policy_version,
+            expected_worlds=self.config.worlds,
+            expected_max_steps=self.config.max_steps,
+            last_revision=self.last_revision,
+        )
+        if snapshot is None:
+            return
+        self.state = snapshot
+        self.last_revision = snapshot.revision
+        self.warning = None
+        for item in snapshot.phase_history:
+            item_revision = int(item["revision"])
+            if item_revision <= self._seen_phase_revision:
+                continue
+            phase = str(item["phase"])
+            if phase != "READY" and (not self._phase_queue or self._phase_queue[-1] != phase):
+                self._phase_queue.append(phase)
+            self._seen_phase_revision = item_revision
+
+    def poll(
+        self,
+        now: float | None = None,
+        *,
+        read_state: Callable[[Path], Any] | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        assert self.process is not None
+        current_time = time.monotonic() if now is None else float(now)
+        return_code = self.process.poll()
+        should_read = current_time >= self.next_poll_at or return_code is not None
+        read_attempted = False
+        if should_read:
+            read_attempted = True
+            self.next_poll_at = current_time + LIVE_STATE_POLL_SECONDS
+            reader = _read_live_state if read_state is None else read_state
+            try:
+                self._accept_state(reader(self.config.live_state_path))
+            except FileNotFoundError:
+                self.warning = "WAITING FOR CONTROLLER LIVE STATE"
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                self.warning = f"LIVE STATE NOT YET VALID: {exc}"
+
+        if return_code is None:
+            return
+        if not read_attempted:
+            return
+        if return_code != 0:
+            detail = "controller process failed"
+            if self.state is not None and self.state.error is not None:
+                detail = str(self.state.error.get("message") or detail)
+            self._fail(f"LIVE TRAINING FAILED: {detail}")
+            return
+        if self.state is None or self.state.phase != "GENERATION_COMPLETE":
+            self._fail("LIVE TRAINING FAILED: controller exited without GENERATION_COMPLETE")
+            return
+        try:
+            completed = _load_completed_live_generation(self.state, self.config)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            self._fail(f"LIVE TRAINING FAILED: {exc}")
+            return
+        next_policy = self.state.next_policy_version
+        next_generation = self.state.next_generation
+        assert next_policy is not None and next_generation is not None
+        self.current_policy_version = next_policy
+        self.current_generation = next_generation
+        self.current_checkpoint = completed[1]
+        self._completed = completed
+        self.process = None
+        self.error = None
+        self.locked_notice = False
+
+    def _fail(self, message: str) -> None:
+        self.error = message
+        self.process = None
+        self.locked_notice = False
+        self._phase_queue.clear()
+        self._display_phase = "ERROR"
+
+    def take_completed_generation(self) -> list[AttemptTrail] | None:
+        if self._completed is None:
+            return None
+        attempts, _ = self._completed
+        self._completed = None
+        return attempts
+
+    def display_phase(self, now: float | None = None) -> str:
+        current_time = time.monotonic() if now is None else float(now)
+        if self._phase_queue and (
+            self._display_phase is None or current_time >= self._display_phase_until
+        ):
+            self._display_phase = self._phase_queue.popleft()
+            hold = 0.75 if self._display_phase in {"TRAINING_POLICY", "POLICY_UPDATED"} else 0.35
+            self._display_phase_until = current_time + hold
+        if self._display_phase is not None and current_time < self._display_phase_until:
+            return self._display_phase
+        if self.error is not None:
+            return "ERROR"
+        if self.state is not None:
+            return self.state.phase
+        return "READY"
 
 
 def _xy(value: Any) -> tuple[float, float]:
@@ -2398,6 +3302,366 @@ def _validated_replay_environments(
     return environments
 
 
+def _live_phase_description(state: LiveStateSnapshot | None) -> str:
+    if state is None:
+        return "READY"
+    return state.phase.replace("_", " ")
+
+
+def _draw_live_overlay(
+    screen: Any,
+    fonts: tuple[Any, Any, Any],
+    *,
+    state: LiveStateSnapshot | None,
+    fallback_generation: int,
+    fallback_policy_version: int,
+    replay_mode: bool,
+    locked: bool,
+) -> None:
+    """Draw the live controller state, lifecycle stream, and control guidance."""
+
+    assert pygame is not None
+    title_font, text_font, small_font = fonts
+    generation = state.generation if state is not None else fallback_generation
+    policy_version = (
+        state.policy_version_used if state is not None else fallback_policy_version
+    )
+    phase = _live_phase_description(state)
+    message = state.message if state is not None else "ready for input"
+
+    outer = pygame.Rect(18, 18, 482, 192)
+    translucent_panel(screen, outer)
+    y = 31
+    screen.blit(title_font.render("LIVE DAYTONA TRAINING", True, WHITE), (34, y))
+    y += 31
+    screen.blit(text_font.render(f"GENERATION {generation}", True, WHITE), (34, y))
+    screen.blit(text_font.render(f"POLICY v{policy_version}", True, CYAN), (176, y))
+    y += 24
+    screen.blit(small_font.render(f"PHASE {phase}", True, GREEN), (34, y))
+
+    current_status = small_font.render(
+        f"STATUS {message[:58]}", True, MUTED
+    )
+    screen.blit(current_status, (34, y + 14))
+
+    if state is None:
+        worlds = ()
+    else:
+        worlds = state.worlds
+    next_row = y + 34
+    for world in worlds:
+        lifecycle = world.lifecycle_state or "READY"
+        sandbox_id = _short_identifier(world.sandbox_id or "no sandbox")
+        reward_text = (
+            f" {world.reward:+.2f}" if world.reward is not None else " n/a"
+        )
+        screen.blit(
+            small_font.render(
+                f"W{world.world_index:02d}: {lifecycle:<14}  {sandbox_id}  {reward_text}",
+                True,
+                WHITE,
+            ),
+            (34, next_row),
+        )
+        next_row += 16
+        if next_row > 178:
+            break
+
+    controls_x = 34
+    controls_y = outer.bottom - 17
+    if locked:
+        controls = "R LOCKED (training in progress)  •  ESC EXIT"
+    elif replay_mode:
+        controls = (
+            "P REPLAY  •  N NEXT WORLD  •  R TRAIN NEXT GENERATION  •  "
+            "ESC EXIT"
+        )
+    elif state is not None and state.phase in {"POLICY_UPDATED", "GENERATION_COMPLETE"}:
+        controls = (
+            "POLICY UPDATE COMPLETE  •  WEIGHTS CHANGED  •  "
+            "PRESS R TO TRAIN NEXT GENERATION  •  ESC EXIT"
+        )
+    else:
+        controls = "PRESS R TO TRAIN NEXT GENERATION  •  ESC EXIT"
+    screen.blit(small_font.render(controls[:94], True, GREEN), (controls_x, controls_y))
+
+    if state is not None and state.phase in {"POLICY_UPDATED", "GENERATION_COMPLETE"}:
+        if state.policy_update is not None and state.policy_update.get("weights_changed") is True:
+            screen.blit(
+                small_font.render("REINFORCE UPDATE  •  WEIGHTS CHANGED", True, CYAN),
+                (34, controls_y - 16),
+            )
+        if state.next_policy_version is not None:
+            screen.blit(
+                small_font.render(
+                    f"POLICY v{state.policy_version_used} -> v{state.next_policy_version}",
+                    True,
+                    GREEN,
+                ),
+                (34, controls_y - 33),
+            )
+
+
+def run_live_demo(
+    *args: Any,
+    seed: int = 7,
+    max_frames: int | None = None,
+    worlds: int = DEFAULT_LIVE_WORLDS,
+    max_steps: int = DEFAULT_LIVE_MAX_STEPS,
+    runs_dir: Path = DEFAULT_LIVE_RUNS_DIR,
+    checkpoint_dir: Path = DEFAULT_LIVE_CHECKPOINT_DIR,
+    live_state_path: Path | None = None,
+    snapshot_name: str = DEFAULT_LIVE_SNAPSHOT_NAME,
+    start_generation: int = 0,
+    start_policy_version: int = 0,
+    start_checkpoint: Path | None = None,
+) -> None:
+    """Run the live interactive controller loop with live training status."""
+
+    if len(args) != 0:
+        raise TypeError("run_live_demo does not accept positional arguments")
+    if pygame is None:
+        raise SystemExit(
+            "Pygame is required. Install the project dependencies, then run "
+            "python visual_demo.py"
+        )
+
+    repo_root = Path.cwd().resolve()
+    session_config = LiveTrainingConfig(
+        repo_root=repo_root,
+        snapshot_name=str(snapshot_name),
+        worlds=int(worlds),
+        max_steps=int(max_steps),
+        runs_dir=Path(runs_dir),
+        checkpoint_dir=Path(checkpoint_dir),
+        live_state_path=(
+            Path(live_state_path)
+            if live_state_path is not None
+            else repo_root / "runs" / LIVE_STATE_FILENAME
+        ),
+        base_seed=DEFAULT_LIVE_BASE_SEED,
+        start_generation=int(start_generation),
+        policy_version=int(start_policy_version),
+        start_checkpoint=(
+            Path(start_checkpoint) if start_checkpoint is not None else None
+        ),
+    )
+    session = LiveTrainingSession(session_config)
+
+    pygame.init()
+    try:
+        screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        clock = pygame.time.Clock()
+        fonts = (
+            pygame.font.SysFont("menlo", 24, bold=True),
+            pygame.font.SysFont("menlo", 15),
+            pygame.font.SysFont("menlo", 12, bold=True),
+        )
+        pygame.display.set_caption("Gravity Gauntlet — LIVE DAYTONA TRAINING")
+
+        attempts: list[AttemptTrail] = []
+        replay_attempts = attempts
+        replay_mode = False
+        replay_index = 0
+        active_attempt = None
+        current_seed = int(seed)
+        preview_envs = {int(seed): GravityEnv(seed=seed)}
+        env = preview_envs[current_seed]
+        background, stars = make_background(current_seed)
+        trail: deque[tuple[float, float]] = deque(
+            [_xy(env.ship_position)], maxlen=TRAIL_LENGTH
+        )
+        ship_angle = -math.pi / 2
+        replay_cursor = 0.0
+        replay_end_frames = 0
+        frame_count = 0
+        running = True
+
+        while running:
+            session.poll(read_state=_read_live_state)
+            completed = session.take_completed_generation()
+            if completed is not None:
+                attempts = completed
+                replay_attempts = attempts
+                try:
+                    preview_envs = _validated_replay_environments(replay_attempts)
+                except ValueError:
+                    attempts = []
+                    replay_attempts = []
+                    replay_mode = False
+                    active_attempt = None
+                    env = preview_envs.get(current_seed, GravityEnv(seed=current_seed))
+                    background, stars = make_background(current_seed)
+                else:
+                    replay_index = _initial_replay_index(
+                        replay_attempts,
+                        None,
+                    )
+                    active_attempt = replay_attempts[replay_index]
+                    current_seed = int(active_attempt.seed)
+                    env = preview_envs[current_seed]
+                    background, stars = make_background(current_seed)
+                    replay_cursor = 0.0
+                    replay_end_frames = 0
+                    ship_angle = -math.pi / 2
+                    replay_mode = bool(replay_attempts)
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_p:
+                        if replay_mode and replay_attempts:
+                            replay_cursor = 0.0
+                            replay_end_frames = 0
+                            ship_angle = -math.pi / 2
+                    elif event.key == pygame.K_n:
+                        if replay_mode and len(replay_attempts) > 1:
+                            replay_index = (replay_index + 1) % len(replay_attempts)
+                            active_attempt = replay_attempts[replay_index]
+                            current_seed = int(active_attempt.seed)
+                            env = preview_envs[current_seed]
+                            background, stars = make_background(current_seed)
+                            replay_cursor = 0.0
+                            replay_end_frames = 0
+                            ship_angle = -math.pi / 2
+                    elif event.key == pygame.K_r:
+                        state = session.state
+                        can_launch = (
+                            not session.active
+                            and (state is None or state.ready_for_next_generation)
+                        )
+                        if can_launch:
+                            if session.request_generation():
+                                replay_mode = False
+                                attempts = []
+                                replay_attempts = []
+                                active_attempt = None
+                                replay_cursor = 0.0
+                                replay_end_frames = 0
+                                ship_angle = -math.pi / 2
+                                current_seed = int(seed)
+                                env = GravityEnv(seed=current_seed)
+                                preview_envs = {current_seed: env}
+                                background, stars = make_background(current_seed)
+                                trail = deque([_xy(env.ship_position)], maxlen=TRAIL_LENGTH)
+                        else:
+                            session.locked_notice = True
+
+            if replay_mode and active_attempt is not None:
+                assert active_attempt.seed is not None
+                cursor = min(int(replay_cursor), len(active_attempt.points) - 1)
+                position = active_attempt.points[cursor]
+                recorded_velocity = _recorded_velocity(active_attempt, cursor)
+                velocity = recorded_velocity if recorded_velocity is not None else (0.0, 0.0)
+                thrust = _recorded_thrust(active_attempt, cursor)
+            else:
+                thrust = (0.0, 0.0)
+                if env.done:
+                    # READY-screen attract loop only: restart the same deterministic
+                    # preview so the live UI never appears frozen between generations.
+                    env = GravityEnv(seed=current_seed)
+                    preview_envs[current_seed] = env
+                    trail = deque([_xy(env.ship_position)], maxlen=TRAIL_LENGTH)
+                    ship_angle = -math.pi / 2
+                env.step(thrust)
+                position = _xy(env.ship_position)
+                velocity = _xy(env.ship_velocity)
+                if math.hypot(*velocity) > 0.05:
+                    ship_angle = math.atan2(velocity[1], velocity[0])
+                if math.hypot(position[0] - trail[-1][0], position[1] - trail[-1][1]) >= 0.25:
+                    trail.append(position)
+
+            if replay_mode and active_attempt is not None:
+                assert active_attempt.seed is not None
+                assert active_attempt.world_index is not None
+                if cursor < len(active_attempt.points) - 1:
+                    replay_cursor = min(
+                        len(active_attempt.points) - 1,
+                        replay_cursor
+                        + max(
+                            0.05,
+                            (len(active_attempt.points) - 1)
+                            / (REPLAY_TARGET_SECONDS * FPS),
+                        ),
+                    )
+                    replay_end_frames = 0
+                else:
+                    replay_end_frames += 1
+                    if (
+                        len(replay_attempts) > 1
+                        and replay_end_frames >= round(REPLAY_END_HOLD_SECONDS * FPS)
+                    ):
+                        replay_index = (replay_index + 1) % len(replay_attempts)
+                        active_attempt = replay_attempts[replay_index]
+                        current_seed = int(active_attempt.seed)
+                        env = preview_envs[current_seed]
+                        background, stars = make_background(current_seed)
+                        replay_cursor = 0.0
+                        replay_end_frames = 0
+                        ship_angle = -math.pi / 2
+            elif math.hypot(*velocity) > 0.05:
+                ship_angle = math.atan2(velocity[1], velocity[0])
+
+            elapsed = pygame.time.get_ticks() / 1000.0
+            screen.blit(background, (0, 0))
+            draw_stars(screen, stars, elapsed)
+
+            if replay_mode and active_attempt is not None:
+                draw_recorded_trail(screen, active_attempt, cursor)
+            else:
+                draw_trail(screen, trail)
+
+            draw_planets(screen, env.planets, current_seed)
+            draw_asteroids(screen, env.asteroids, current_seed)
+            draw_portal(screen, env.portal, elapsed)
+            draw_speed_streaks(screen, position, velocity)
+            draw_ship(screen, position, ship_angle, thrust, float(env.ship_radius))
+
+            _draw_live_overlay(
+                screen,
+                fonts,
+                state=session.state,
+                fallback_generation=session.current_generation,
+                fallback_policy_version=session.current_policy_version,
+                replay_mode=bool(replay_attempts),
+                locked=session.active,
+            )
+
+            if replay_mode and active_attempt is not None:
+                draw_parallel_universes(
+                    screen,
+                    replay_attempts,
+                    active_attempt,
+                    preview_envs,
+                    fonts,
+                )
+                draw_lifecycle_panel(screen, active_attempt, fonts)
+                if attempts:
+                    draw_learning_history_panel(screen, attempts, fonts)
+
+            draw_recorded_end_overlay(
+                screen,
+                active_attempt or attempts[0],
+                position,
+                _position(env.portal),
+                fonts,
+                elapsed,
+                finished=False,
+            ) if replay_mode and active_attempt is not None else None
+
+            pygame.display.flip()
+
+            clock.tick(FPS)
+            frame_count += 1
+            if max_frames is not None and frame_count >= max_frames:
+                running = False
+    finally:
+        pygame.quit()
+
+
 def run_demo(
     seed: int | None = 7,
     max_frames: int | None = None,
@@ -2618,9 +3882,9 @@ def run_demo(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Replay real Gravity Gauntlet generation JSON or run an explicit local preview."
+        description="Run live Daytona training or replay verified generation artifacts."
     )
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--rollouts",
         type=Path,
@@ -2630,6 +3894,23 @@ def main() -> None:
         "--local-preview",
         action="store_true",
         help="run the keyboard-driven local development mode; never labelled Daytona",
+    )
+    source.add_argument(
+        "--live",
+        action="store_true",
+        help="run live Daytona integration training from the interactive panel",
+    )
+    parser.add_argument(
+        "--live-worlds",
+        type=int,
+        default=DEFAULT_LIVE_WORLDS,
+        help="number of parallel Daytona worlds for live mode",
+    )
+    parser.add_argument(
+        "--live-max-steps",
+        type=int,
+        default=DEFAULT_LIVE_MAX_STEPS,
+        help="maximum physics steps per live world",
     )
     parser.add_argument(
         "--seed",
@@ -2641,9 +3922,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.local_preview and (args.generation is not None or args.policy_version is not None):
         parser.error("--generation and --policy-version require --rollouts, not --local-preview")
+    if args.live and (args.generation is not None or args.policy_version is not None or args.seed is not None):
+        parser.error("--generation, --policy-version, and --seed are controlled by live replay artifacts")
     try:
-        rollout_trails = load_rollout_trails(args.rollouts) if args.rollouts else []
-        if rollout_trails:
+        if args.rollouts:
+            rollout_trails = load_rollout_trails(args.rollouts)
             selected_group = _select_replay_group(
                 rollout_trails,
                 generation=args.generation,
@@ -2658,19 +3941,54 @@ def main() -> None:
             seed = args.seed if args.seed is not None else 7
             generation = args.generation
             policy_version = args.policy_version
+            rollout_trails = []
+
+        if args.live:
+            run_live_demo(
+                seed=seed,
+                max_frames=int(smoke_frames) if smoke_frames else None,
+                worlds=args.live_worlds,
+                max_steps=args.live_max_steps,
+            )
+            return
+
+        if args.local_preview:
+            seed = args.seed if args.seed is not None else 7
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         parser.error(f"cannot load rollout replay: {exc}")
+    else:
+        if args.rollouts:
+            smoke_frames = os.environ.get("GRAVITY_DEMO_MAX_FRAMES")
+            try:
+                run_demo(
+                    seed,
+                    int(smoke_frames) if smoke_frames else None,
+                    rollout_trails=rollout_trails,
+                    generation=generation,
+                    policy_version=policy_version,
+                )
+            except ValueError as exc:
+                parser.error(f"cannot replay rollout: {exc}")
+            return
+        if args.local_preview:
+            run_demo(
+                seed,
+                int(smoke_frames) if smoke_frames else None,
+            )
+            return
+
     smoke_frames = os.environ.get("GRAVITY_DEMO_MAX_FRAMES")
-    try:
-        run_demo(
-            seed,
-            int(smoke_frames) if smoke_frames else None,
-            rollout_trails=rollout_trails,
-            generation=generation,
-            policy_version=policy_version,
-        )
-    except ValueError as exc:
-        parser.error(f"cannot replay rollout: {exc}")
+    smoke_frames = os.environ.get("GRAVITY_DEMO_MAX_FRAMES")
+    if not (args.rollouts or args.local_preview or args.live):
+        try:
+            run_live_demo(
+                seed=seed,
+                max_frames=int(smoke_frames) if smoke_frames else None,
+                worlds=args.live_worlds,
+                max_steps=args.live_max_steps,
+            )
+        except ValueError as exc:
+            parser.error(f"cannot run live loop: {exc}")
 
 
 if __name__ == "__main__":

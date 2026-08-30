@@ -27,6 +27,19 @@ LIFECYCLE_STATES = (
     "RESULT_COLLECTED",
 )
 
+LIVE_TRAINING_PHASES = (
+    "READY",
+    "FREEZING_POLICY",
+    "CREATING_DAYTONA_WORLDS",
+    "RUNNING_DAYTONA",
+    "COLLECTING_EXPERIENCES",
+    "TRAINING_POLICY",
+    "POLICY_UPDATED",
+    "LAUNCHING_NEXT_GENERATION",
+    "GENERATION_COMPLETE",
+    "ERROR",
+)
+
 
 def utc_timestamp() -> str:
     """Return an ISO-8601 UTC timestamp suitable for JSON output."""
@@ -329,9 +342,73 @@ class TrainingState:
         )
 
 
+@dataclass(slots=True)
+class LiveTrainingState:
+    """Small atomic bridge between the controller and live visual mode.
+
+    Completed trajectories stay in ``generation_NNN.json``.  This state file
+    contains only real lifecycle progress, trainer evidence, and the exact
+    completed artifact path the visual loader may validate and replay.
+    """
+
+    execution_backend: str
+    invocation_id: str
+    requested_generations: int
+    requested_worlds: int
+    max_steps: int
+    generation: int
+    policy_version_used: int
+    phase: str = "READY"
+    revision: int = 0
+    next_generation: int | None = None
+    next_policy_version: int | None = None
+    worlds_expected: int = 0
+    sandboxes_live: int = 0
+    experiences_collected: int = 0
+    worlds: list[dict[str, Any]] = field(default_factory=list)
+    trainer_metrics: dict[str, Any] | None = None
+    policy_update: dict[str, Any] | None = None
+    generation_json: str | None = None
+    latest_valid: dict[str, Any] | None = None
+    completed_generations: int = 0
+    ready_for_next_generation: bool = False
+    interrupted: bool = False
+    error: dict[str, Any] | None = None
+    message: str = ""
+    phase_history: list[dict[str, Any]] = field(default_factory=list)
+    updated_at: str = field(default_factory=utc_timestamp)
+    schema_version: int = 1
+    mode: str = "live_daytona_training"
+
+    def __post_init__(self) -> None:
+        if self.phase not in LIVE_TRAINING_PHASES:
+            raise ValueError(f"unknown live-training phase: {self.phase}")
+        if not isinstance(self.execution_backend, str) or not self.execution_backend:
+            raise ValueError("execution_backend must be a non-empty string")
+        if not isinstance(self.invocation_id, str) or not self.invocation_id:
+            raise ValueError("invocation_id must be a non-empty string")
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        # Stable visual-facing aliases keep the bridge readable while the
+        # canonical field names remain explicit in the dataclass.
+        result["worlds_requested"] = self.requested_worlds
+        result["worlds_collected"] = self.experiences_collected
+        result["generation_path"] = self.generation_json
+        result["training"] = self.trainer_metrics
+        return json_safe(result)
+
+    def to_json(self, *, indent: int = 2) -> str:
+        return json.dumps(
+            self.to_dict(), indent=indent, sort_keys=True, allow_nan=False
+        )
+
+
 __all__ = [
     "GenerationState",
     "LIFECYCLE_STATES",
+    "LIVE_TRAINING_PHASES",
+    "LiveTrainingState",
     "TrainingState",
     "WorldState",
     "json_safe",

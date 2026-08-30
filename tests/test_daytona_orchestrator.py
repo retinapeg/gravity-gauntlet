@@ -276,6 +276,62 @@ def patched_snapshot(client: FakeDaytona):
 
 
 class DaytonaGenerationTests(unittest.IsolatedAsyncioTestCase):
+    def test_missing_python_ca_uses_certifi_without_disabling_tls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "cacert.pem"
+            bundle.write_text("test CA bundle", encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {}, clear=False),
+                mock.patch.object(
+                    orchestrator.ssl,
+                    "get_default_verify_paths",
+                    return_value=SimpleNamespace(
+                        cafile=None,
+                        capath=None,
+                        openssl_cafile_env="SSL_CERT_FILE",
+                        openssl_capath_env="SSL_CERT_DIR",
+                    ),
+                ),
+                mock.patch("certifi.where", return_value=str(bundle)),
+            ):
+                os.environ.pop("SSL_CERT_FILE", None)
+                os.environ.pop("SSL_CERT_DIR", None)
+
+                selected = orchestrator._configure_tls_ca_bundle()
+
+                self.assertEqual(selected, str(bundle))
+                self.assertEqual(os.environ["SSL_CERT_FILE"], str(bundle))
+
+    def test_explicit_ca_configuration_is_preserved(self) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"SSL_CERT_FILE": "/private/company-ca.pem"},
+                clear=False,
+            ),
+            mock.patch.object(
+                orchestrator.ssl,
+                "get_default_verify_paths",
+                return_value=SimpleNamespace(
+                    cafile=None,
+                    capath=None,
+                    openssl_cafile_env="SSL_CERT_FILE",
+                    openssl_capath_env="SSL_CERT_DIR",
+                ),
+            ),
+            mock.patch(
+                "certifi.where",
+                side_effect=AssertionError("explicit CA must win"),
+            ),
+        ):
+            selected = orchestrator._configure_tls_ca_bundle()
+
+            self.assertIsNone(selected)
+            self.assertEqual(
+                os.environ["SSL_CERT_FILE"],
+                "/private/company-ca.pem",
+            )
+
     async def test_eight_worlds_run_concurrently_with_exact_transport_and_events(
         self,
     ) -> None:

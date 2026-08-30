@@ -23,12 +23,16 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Any
+import uuid
 
 from .demo_state import (
     GenerationState,
+    LIVE_TRAINING_PHASES,
+    LiveTrainingState,
     TrainingState,
     WorldState,
     json_safe,
+    utc_timestamp,
     validate_visual_trajectory,
 )
 
@@ -40,6 +44,35 @@ DEFAULT_BASE_SEED = 18_473
 DEFAULT_INITIAL_POLICY_VERSION = 0
 DEFAULT_RUNS_DIR = Path("runs")
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
+LIVE_STATE_FILENAME = "live_state.json"
+LIVE_PHASE_HISTORY_LIMIT = 32
+TRAINER_METRIC_FIELDS = (
+    "episodes",
+    "transitions",
+    "loss",
+    "policy_loss",
+    "entropy",
+    "gradient_norm",
+    "parameter_l2_delta",
+    "parameter_max_abs_delta",
+    "changed_parameter_tensors",
+    "changed_parameter_elements",
+    "weights_changed",
+    "mean_reward_to_go",
+    "std_reward_to_go",
+    "advantage_mean",
+    "advantage_std",
+)
+REQUIRED_TRAINER_METRICS = (
+    "episodes",
+    "transitions",
+    "loss",
+    "entropy",
+    "parameter_l2_delta",
+    "changed_parameter_tensors",
+    "changed_parameter_elements",
+    "weights_changed",
+)
 
 
 class IntegrationUnavailableError(RuntimeError):
@@ -56,6 +89,289 @@ class IntegrationComponents:
 
     run_daytona_training: Callable[..., Any]
     execution_backend: str = "fixture"
+
+
+class LiveStateTracker:
+    """Atomically publish genuine controller progress for a visual client."""
+
+    def __init__(
+        self,
+        *,
+        path: str | Path,
+        invocation_id: str,
+        execution_backend: str,
+        generations: int,
+        worlds: int,
+        max_steps: int,
+        start_generation: int,
+        policy_version: int,
+        latest_valid: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self._worlds: dict[int, dict[str, Any]] = {}
+        self._collected_worlds: set[int] = set()
+        self.state = LiveTrainingState(
+            execution_backend=execution_backend,
+            invocation_id=invocation_id,
+            requested_generations=generations,
+            requested_worlds=worlds,
+            max_steps=max_steps,
+            generation=start_generation,
+            policy_version_used=policy_version,
+            worlds_expected=worlds,
+            latest_valid=(
+                None if latest_valid is None else json_safe(dict(latest_valid))
+            ),
+        )
+        self.transition(
+            "READY",
+            message=(
+                f"generation {start_generation} / policy v{policy_version} ready"
+            ),
+            ready_for_next_generation=True,
+        )
+
+    def transition(self, phase: str, *, message: str, **changes: Any) -> None:
+        if phase not in LIVE_TRAINING_PHASES:
+            raise IntegrationContractError(f"unknown live-training phase: {phase}")
+        for key, value in changes.items():
+            if not hasattr(self.state, key):
+                raise IntegrationContractError(
+                    f"unknown live-training state field: {key}"
+                )
+            setattr(self.state, key, json_safe(value))
+        self.state.phase = phase
+        self.state.message = str(message)
+        self.state.updated_at = utc_timestamp()
+        self.state.revision += 1
+        self.state.phase_history.append(
+            {
+                "revision": self.state.revision,
+                "phase": phase,
+                "generation": self.state.generation,
+                "policy_version_used": self.state.policy_version_used,
+                "next_policy_version": self.state.next_policy_version,
+                "experiences_collected": self.state.experiences_collected,
+                "timestamp": self.state.updated_at,
+            }
+        )
+        if len(self.state.phase_history) > LIVE_PHASE_HISTORY_LIMIT:
+            del self.state.phase_history[:-LIVE_PHASE_HISTORY_LIMIT]
+        self._write()
+
+    def prepare_generation(self, generation: int, policy_version: int) -> None:
+        self._worlds = {
+            world_index: {
+                "world_index": world_index,
+                "seed": None,
+                "sandbox_id": None,
+                "lifecycle_state": None,
+                "reward": None,
+                "success": None,
+                "termination": None,
+                "result_collected": False,
+                "error": None,
+                "lifecycle": [],
+            }
+            for world_index in range(1, self.state.worlds_expected + 1)
+        }
+        self._collected_worlds.clear()
+        self.transition(
+            "FREEZING_POLICY",
+            message=f"freezing policy v{policy_version}",
+            generation=int(generation),
+            policy_version_used=int(policy_version),
+            next_generation=None,
+            next_policy_version=None,
+            sandboxes_live=0,
+            experiences_collected=0,
+            worlds=self._ordered_worlds(),
+            trainer_metrics=None,
+            policy_update=None,
+            generation_json=None,
+            ready_for_next_generation=False,
+            interrupted=False,
+            error=None,
+        )
+
+    def lifecycle_event(self, event: Mapping[str, Any]) -> None:
+        captured = json_safe(dict(event))
+        generation = _non_negative_int(captured.get("generation"), "generation")
+        policy_version = _non_negative_int(
+            captured.get("policy_version"), "policy_version"
+        )
+        if (
+            generation != self.state.generation
+            or policy_version != self.state.policy_version_used
+        ):
+            raise IntegrationContractError(
+                "live lifecycle identity does not match the active frozen policy: "
+                f"generation={generation}, policy=v{policy_version}, expected "
+                f"generation={self.state.generation}, "
+                f"policy=v{self.state.policy_version_used}"
+            )
+        world_index = _positive_int(captured.get("world"), "world")
+        if world_index > self.state.worlds_expected:
+            raise IntegrationContractError(
+                f"live lifecycle world {world_index} exceeds requested world count "
+                f"{self.state.worlds_expected}"
+            )
+        lifecycle_state = str(captured.get("state", ""))
+        if not lifecycle_state:
+            raise IntegrationContractError("live lifecycle state is required")
+        world = self._worlds[world_index]
+        self._merge_identity(world, captured, field="seed")
+        self._merge_identity(world, captured, field="sandbox_id")
+        world["lifecycle_state"] = lifecycle_state
+        if captured.get("reward") is not None:
+            world["reward"] = captured["reward"]
+        if captured.get("termination") is not None:
+            world["termination"] = captured["termination"]
+        if lifecycle_state == "SUCCESS":
+            world["success"] = True
+        elif lifecycle_state in {"COLLISION", "OUT_OF_BOUNDS", "TIMEOUT"}:
+            world["success"] = False
+        if lifecycle_state == "ERROR":
+            world["error"] = captured.get("error") or "Daytona world error"
+        if lifecycle_state == "RESULT_COLLECTED":
+            world["result_collected"] = True
+            self._collected_worlds.add(world_index)
+        world["lifecycle"].append(captured)
+        if len(world["lifecycle"]) > 16:
+            del world["lifecycle"][:-16]
+
+        self.state.worlds = self._ordered_worlds()
+        self.state.sandboxes_live = sum(
+            bool(item.get("sandbox_id")) for item in self._worlds.values()
+        )
+        self.state.experiences_collected = len(self._collected_worlds)
+        if self._collected_worlds:
+            phase = "COLLECTING_EXPERIENCES"
+            message = (
+                f"{len(self._collected_worlds)}/{self.state.worlds_expected} "
+                "experiences collected"
+            )
+        elif lifecycle_state == "CREATING":
+            phase = "CREATING_DAYTONA_WORLDS"
+            message = "creating Daytona worlds"
+        else:
+            phase = "RUNNING_DAYTONA"
+            message = (
+                f"{self.state.sandboxes_live}/{self.state.worlds_expected} "
+                "Daytona worlds live"
+            )
+        if self.state.phase != phase:
+            self.transition(phase, message=message)
+        else:
+            self.state.message = message
+            self._write_revision()
+
+    def training_started(self) -> None:
+        self.transition(
+            "TRAINING_POLICY",
+            message=(
+                f"REINFORCE update from {self.state.experiences_collected}/"
+                f"{self.state.worlds_expected} experiences"
+            ),
+        )
+
+    def generation_completed(
+        self,
+        *,
+        generation: int,
+        policy_version: int,
+        next_policy_version: int,
+        record: Mapping[str, Any],
+        policy_update: Mapping[str, Any],
+        generation_path: str | Path,
+    ) -> None:
+        metrics = trainer_metrics_from_record(
+            record,
+            expected_episodes=self.state.worlds_expected,
+        )
+        if policy_update.get("weights_changed") is not True:
+            raise IntegrationContractError(
+                "controller checkpoint proof did not verify changed weights"
+            )
+        completed_path = str(Path(generation_path))
+        latest_valid = {
+            "generation": int(generation),
+            "policy_version_used": int(policy_version),
+            "next_policy_version": int(next_policy_version),
+            "generation_json": completed_path,
+            "checkpoint": policy_update["next_checkpoint"],
+            "checkpoint_model_sha256": policy_update["next_model_sha256"],
+        }
+        self.transition(
+            "POLICY_UPDATED",
+            message=f"weights changed: policy v{policy_version} -> v{next_policy_version}",
+            next_generation=int(generation) + 1,
+            next_policy_version=int(next_policy_version),
+            trainer_metrics=metrics,
+            policy_update=json_safe(dict(policy_update)),
+            generation_json=completed_path,
+            latest_valid=latest_valid,
+        )
+        self.transition(
+            "GENERATION_COMPLETE",
+            message=(
+                f"generation {generation} complete; policy v{next_policy_version} ready"
+            ),
+            completed_generations=self.state.completed_generations + 1,
+            ready_for_next_generation=True,
+        )
+
+    def launch_next_generation(self, generation: int, policy_version: int) -> None:
+        self.transition(
+            "LAUNCHING_NEXT_GENERATION",
+            message=(
+                f"launching generation {generation} with policy v{policy_version}"
+            ),
+            next_generation=int(generation),
+            next_policy_version=int(policy_version),
+            ready_for_next_generation=False,
+        )
+        self.prepare_generation(generation, policy_version)
+
+    def fail(self, error: BaseException, *, interrupted: bool = False) -> None:
+        self.transition(
+            "ERROR",
+            message=("training interrupted" if interrupted else "training failed"),
+            ready_for_next_generation=False,
+            interrupted=bool(interrupted),
+            error={
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+        )
+
+    def _merge_identity(
+        self,
+        world: dict[str, Any],
+        event: Mapping[str, Any],
+        *,
+        field: str,
+    ) -> None:
+        incoming = event.get(field)
+        if incoming is None:
+            return
+        current = world.get(field)
+        if current is not None and current != incoming:
+            raise IntegrationContractError(
+                f"world {world['world_index']} emitted conflicting {field} values"
+            )
+        world[field] = incoming
+
+    def _ordered_worlds(self) -> list[dict[str, Any]]:
+        return [dict(self._worlds[index]) for index in sorted(self._worlds)]
+
+    def _write_revision(self) -> None:
+        self.state.updated_at = utc_timestamp()
+        self.state.revision += 1
+        self._write()
+
+    def _write(self) -> None:
+        _atomic_write_json(self.path, self.state.to_dict())
 
 
 class LifecycleCollector:
@@ -139,6 +455,46 @@ def load_integration_components() -> IntegrationComponents:
         run_daytona_training=run_daytona_training,
         execution_backend="daytona",
     )
+
+
+def trainer_metrics_from_record(
+    record: Mapping[str, Any],
+    *,
+    expected_episodes: int,
+) -> dict[str, Any]:
+    """Copy and validate only metrics the canonical trainer actually returned."""
+
+    missing = [key for key in REQUIRED_TRAINER_METRICS if key not in record]
+    if missing:
+        raise IntegrationContractError(
+            "trainer record is missing live proof metric(s): " + ", ".join(missing)
+        )
+    episodes = _positive_int(record["episodes"], "episodes")
+    if episodes != int(expected_episodes):
+        raise IntegrationContractError(
+            f"trainer metrics report {episodes} episodes for "
+            f"{expected_episodes} collected worlds"
+        )
+    _positive_int(record["transitions"], "transitions")
+    _finite_number(record["loss"], "loss")
+    _finite_number(record["entropy"], "entropy")
+    if _finite_number(record["parameter_l2_delta"], "parameter_l2_delta") <= 0.0:
+        raise IntegrationContractError("parameter_l2_delta must prove a real update")
+    _positive_int(record["changed_parameter_tensors"], "changed_parameter_tensors")
+    _positive_int(record["changed_parameter_elements"], "changed_parameter_elements")
+    if record["weights_changed"] is not True:
+        raise IntegrationContractError(
+            "trainer did not prove that the policy weights changed"
+        )
+    metrics = {
+        key: json_safe(record[key])
+        for key in TRAINER_METRIC_FIELDS
+        if key in record
+    }
+    # These short UI labels are direct aliases of real trainer fields.
+    metrics["changed_tensors"] = metrics["changed_parameter_tensors"]
+    metrics["changed_elements"] = metrics["changed_parameter_elements"]
+    return metrics
 
 
 def validate_generation_seeds(
@@ -612,6 +968,7 @@ def checkpoint_model_digest(
     path: str | Path,
     *,
     expected_policy_version: int,
+    expected_obs_dim: int | None = None,
 ) -> str:
     """Hash only the learned model tensors in one trainer checkpoint.
 
@@ -653,6 +1010,16 @@ def checkpoint_model_digest(
             f"policy checkpoint {checkpoint_path} has version {version!r}; "
             f"expected {expected_policy_version}"
         )
+    if expected_obs_dim is not None:
+        checkpoint_obs_dim = payload.get("obs_dim")
+        if (
+            isinstance(checkpoint_obs_dim, bool)
+            or checkpoint_obs_dim != int(expected_obs_dim)
+        ):
+            raise IntegrationContractError(
+                f"policy checkpoint {checkpoint_path} has obs_dim "
+                f"{checkpoint_obs_dim!r}; expected {expected_obs_dim}"
+            )
     model_state = payload.get("model_state_dict")
     if not isinstance(model_state, Mapping) or not model_state:
         raise IntegrationContractError(
@@ -697,11 +1064,16 @@ def verify_policy_checkpoint_update(
     policy_version: int,
     next_policy_version: int,
     trainer_checkpoint: Any,
+    input_checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
     """Return JSON proof that vN and vN+1 contain different model weights."""
 
     checkpoint_root = Path(checkpoint_dir)
-    input_path = checkpoint_root / f"policy_v{policy_version:03d}.pt"
+    input_path = (
+        checkpoint_root / f"policy_v{policy_version:03d}.pt"
+        if input_checkpoint is None
+        else Path(input_checkpoint)
+    )
     expected_next_path = checkpoint_root / f"policy_v{next_policy_version:03d}.pt"
     if not isinstance(trainer_checkpoint, (str, os.PathLike)):
         raise IntegrationContractError(
@@ -749,6 +1121,8 @@ async def run_training_demo(
     runs_dir: str | Path = DEFAULT_RUNS_DIR,
     checkpoint_dir: str | Path = DEFAULT_CHECKPOINT_DIR,
     policy_checkpoint: str | Path | None = None,
+    live_state_path: str | Path | None = None,
+    invocation_id: str | None = None,
     snapshot_name: str | None = None,
     keep_sandboxes: bool = False,
     components: IntegrationComponents | None = None,
@@ -764,16 +1138,19 @@ async def run_training_demo(
     initial_policy_version = _non_negative_int(
         initial_policy_version, "initial_policy_version"
     )
-    if start_generation != 0 or initial_policy_version != 0:
+    if start_generation != initial_policy_version:
         raise IntegrationContractError(
-            "fresh controller runs must start at generation 0 / policy v0; "
-            "v0 is the null-weight uniform policy and v1+ comes only from a "
-            "successful trainer update"
+            "start_generation must match initial_policy_version for one policy per "
+            "generation"
         )
-    if policy_checkpoint is not None:
+    if start_generation == 0 and policy_checkpoint is not None:
         raise IntegrationContractError(
-            "controller checkpoint resume is not yet part of the canonical "
-            "trainer interface"
+            "start_generation 0 requires no policy_checkpoint; provide a checkpoint "
+            "only when resuming v1+"
+        )
+    if start_generation > 0 and policy_checkpoint is None:
+        raise IntegrationContractError(
+            "resuming from generation 1+ requires policy_checkpoint"
         )
     observation_dimension = _resolve_observation_dim(obs_dim)
     if components is None:
@@ -796,19 +1173,47 @@ async def run_training_demo(
             "the production controller must use the Daytona execution backend"
         )
 
+    runs_path = Path(runs_dir)
+    checkpoint_path = Path(checkpoint_dir)
     _preflight_output_paths(
-        runs_dir=Path(runs_dir),
-        checkpoint_dir=Path(checkpoint_dir),
+        runs_dir=runs_path,
+        checkpoint_dir=checkpoint_path,
         generations=generations,
+        start_generation=start_generation,
+        initial_policy_version=initial_policy_version,
         allow_overwrite=bool(allow_overwrite),
     )
+    controller_invocation_id = (
+        uuid.uuid4().hex if invocation_id is None else str(invocation_id).strip()
+    )
+    if not controller_invocation_id:
+        raise IntegrationContractError("invocation_id must be a non-empty string")
+    resolved_live_state_path = (
+        runs_path / LIVE_STATE_FILENAME
+        if live_state_path is None
+        else Path(live_state_path)
+    )
+    live_state = LiveStateTracker(
+        path=resolved_live_state_path,
+        invocation_id=controller_invocation_id,
+        execution_backend=execution_backend,
+        generations=generations,
+        worlds=worlds,
+        max_steps=max_steps,
+        start_generation=start_generation,
+        policy_version=initial_policy_version,
+    )
     training_state = TrainingState(
-        current_generation=-1,
-        current_policy_version=0,
+        current_generation=start_generation - 1,
+        current_policy_version=initial_policy_version,
     )
     lifecycle = LifecycleCollector(echo=echo_lifecycle)
     validated: dict[int, tuple[list[int], list[Mapping[str, Any]]]] = {}
     persisted_identities: list[dict[str, Any]] = []
+
+    def collect_lifecycle(event: Mapping[str, Any]) -> None:
+        lifecycle(event)
+        live_state.lifecycle_event(event)
 
     def validate_before_update(
         policy_version: int,
@@ -829,6 +1234,7 @@ async def run_training_demo(
                 f"trainer validated policy v{version} more than once"
             )
         validated[version] = (seed_values, rollout_values)
+        live_state.training_started()
 
     def persist_after_update(
         record: Mapping[str, Any],
@@ -841,8 +1247,9 @@ async def run_training_demo(
         next_policy_version = _positive_int(
             record.get("next_policy_version"), "next_policy_version"
         )
-        expected_generation = len(persisted_identities)
-        if generation != expected_generation or policy_version != generation:
+        expected_generation = start_generation + len(persisted_identities)
+        expected_policy_version = expected_generation
+        if generation != expected_generation or policy_version != expected_policy_version:
             raise IntegrationContractError(
                 "trainer generation identity is out of order: "
                 f"generation={generation}, policy_version={policy_version}, "
@@ -876,7 +1283,13 @@ async def run_training_demo(
             policy_version=policy_version,
             next_policy_version=next_policy_version,
             trainer_checkpoint=record.get("checkpoint"),
+            input_checkpoint=(
+                policy_checkpoint
+                if policy_version == start_generation and start_generation > 0
+                else None
+            ),
         )
+        trainer_metrics_from_record(record, expected_episodes=worlds)
 
         training_fields = {
             key: value
@@ -940,8 +1353,22 @@ async def run_training_demo(
                 "seeds": list(seeds),
             }
         )
+        live_state.generation_completed(
+            generation=generation,
+            policy_version=policy_version,
+            next_policy_version=next_policy_version,
+            record=record,
+            policy_update=policy_update,
+            generation_path=generation_path,
+        )
         _print_generation_result(generation_state, generation_path)
+        if len(persisted_identities) < generations:
+            live_state.launch_next_generation(
+                generation + 1,
+                next_policy_version,
+            )
 
+    live_state.prepare_generation(start_generation, initial_policy_version)
     try:
         history = loaded.run_daytona_training(
             generations=generations,
@@ -950,65 +1377,78 @@ async def run_training_demo(
             obs_dim=observation_dimension,
             base_seed=int(base_seed),
             checkpoint_dir=checkpoint_dir,
+            start_generation=start_generation,
+            initial_policy_version=initial_policy_version,
+            policy_checkpoint=policy_checkpoint,
             snapshot_name=snapshot_name,
             keep_sandboxes=bool(keep_sandboxes),
-            event_callback=lifecycle,
+            event_callback=collect_lifecycle,
             rollout_validator=validate_before_update,
             on_generation=persist_after_update,
         )
         if inspect.isawaitable(history):
             history = await history
-    except IntegrationContractError:
+    except asyncio.CancelledError as exc:
+        live_state.fail(exc, interrupted=True)
+        raise
+    except IntegrationContractError as exc:
+        live_state.fail(exc)
         raise
     except Exception as exc:
-        raise IntegrationContractError(
+        wrapped = IntegrationContractError(
             "canonical Daytona training failed; no local rollout fallback was "
             f"used: {type(exc).__name__}: {exc}"
-        ) from exc
+        )
+        live_state.fail(wrapped)
+        raise wrapped from exc
 
-    if (
-        isinstance(history, (str, bytes, Mapping))
-        or not isinstance(history, Sequence)
-        or len(history) != generations
-    ):
-        raise IntegrationContractError(
-            "trainer did not return one completed record per requested generation"
-        )
-    if len(persisted_identities) != generations:
-        raise IntegrationContractError(
-            "trainer completed without persisting every validated generation"
-        )
-    if validated:
-        raise IntegrationContractError(
-            "trainer completed with validated rollout batches that were never persisted"
-        )
-    for index, (returned, persisted) in enumerate(
-        zip(history, persisted_identities, strict=True)
-    ):
-        if not isinstance(returned, Mapping):
+    try:
+        if (
+            isinstance(history, (str, bytes, Mapping))
+            or not isinstance(history, Sequence)
+            or len(history) != generations
+        ):
             raise IntegrationContractError(
-                f"trainer history record {index} is not a mapping"
+                "trainer did not return one completed record per requested generation"
             )
-        returned_identity = {
-            "generation": _non_negative_int(
-                returned.get("generation"), "generation"
-            ),
-            "policy_version": _non_negative_int(
-                returned.get("policy_version"), "policy_version"
-            ),
-            "next_policy_version": _positive_int(
-                returned.get("next_policy_version"), "next_policy_version"
-            ),
-            "seeds": validate_generation_seeds(
-                returned.get("seeds"),
-                worlds=worlds,
-            ),
-        }
-        if returned_identity != persisted:
+        if len(persisted_identities) != generations:
             raise IntegrationContractError(
-                f"trainer history record {index} does not match its persisted "
-                "generation identity"
+                "trainer completed without persisting every validated generation"
             )
+        if validated:
+            raise IntegrationContractError(
+                "trainer completed with validated rollout batches that were never persisted"
+            )
+        for index, (returned, persisted) in enumerate(
+            zip(history, persisted_identities, strict=True)
+        ):
+            if not isinstance(returned, Mapping):
+                raise IntegrationContractError(
+                    f"trainer history record {index} is not a mapping"
+                )
+            returned_identity = {
+                "generation": _non_negative_int(
+                    returned.get("generation"), "generation"
+                ),
+                "policy_version": _non_negative_int(
+                    returned.get("policy_version"), "policy_version"
+                ),
+                "next_policy_version": _positive_int(
+                    returned.get("next_policy_version"), "next_policy_version"
+                ),
+                "seeds": validate_generation_seeds(
+                    returned.get("seeds"),
+                    worlds=worlds,
+                ),
+            }
+            if returned_identity != persisted:
+                raise IntegrationContractError(
+                    f"trainer history record {index} does not match its persisted "
+                    "generation identity"
+                )
+    except IntegrationContractError as exc:
+        live_state.fail(exc)
+        raise
     return training_state
 
 
@@ -1232,18 +1672,28 @@ def _preflight_output_paths(
     runs_dir: Path,
     checkpoint_dir: Path,
     generations: int,
+    start_generation: int,
+    initial_policy_version: int,
     allow_overwrite: bool,
 ) -> None:
     if allow_overwrite:
         return
+    start_generation = _non_negative_int(start_generation, "start_generation")
+    initial_policy_version = _non_negative_int(
+        initial_policy_version,
+        "initial_policy_version",
+    )
     targets = [
         runs_dir / f"generation_{generation:03d}.json"
-        for generation in range(generations)
+        for generation in range(start_generation, start_generation + generations)
     ]
-    targets.append(runs_dir / "training_state.json")
+    if start_generation == 0:
+        targets.append(runs_dir / "training_state.json")
+    start_checkpoint = 0 if start_generation == 0 else initial_policy_version + 1
+    end_checkpoint = initial_policy_version + generations
     targets.extend(
         checkpoint_dir / f"policy_v{version:03d}.pt"
-        for version in range(generations + 1)
+        for version in range(start_checkpoint, end_checkpoint + 1)
     )
     existing = [path for path in targets if path.exists()]
     if existing:
@@ -1264,6 +1714,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-seed", type=int, default=DEFAULT_BASE_SEED)
     parser.add_argument("--obs-dim", type=int)
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
+    parser.add_argument("--start-generation", type=int, default=0)
+    parser.add_argument(
+        "--initial-policy-version",
+        type=int,
+        default=DEFAULT_INITIAL_POLICY_VERSION,
+    )
+    parser.add_argument("--policy-checkpoint", type=Path)
+    parser.add_argument(
+        "--live-state-path",
+        type=Path,
+        help="atomic visual bridge (default: <runs-dir>/live_state.json)",
+    )
+    parser.add_argument(
+        "--invocation-id",
+        help="optional visual/controller correlation token; never a sandbox ID",
+    )
     parser.add_argument(
         "--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR
     )
@@ -1290,12 +1756,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 obs_dim=args.obs_dim,
                 runs_dir=args.runs_dir,
                 checkpoint_dir=args.checkpoint_dir,
+                start_generation=args.start_generation,
+                initial_policy_version=args.initial_policy_version,
+                policy_checkpoint=args.policy_checkpoint,
+                live_state_path=args.live_state_path,
+                invocation_id=args.invocation_id,
                 snapshot_name=args.snapshot_name,
                 keep_sandboxes=args.keep_sandboxes,
                 echo_lifecycle=not args.quiet_lifecycle,
                 allow_overwrite=args.overwrite,
             )
         )
+    except KeyboardInterrupt as exc:
+        raise SystemExit(130) from exc
     except (IntegrationUnavailableError, IntegrationContractError, ValueError) as exc:
         raise SystemExit(f"GRAVITY GAUNTLET FAILED: {exc}") from exc
 
@@ -1309,6 +1782,7 @@ __all__ = [
     "IntegrationContractError",
     "IntegrationUnavailableError",
     "LifecycleCollector",
+    "LiveStateTracker",
     "build_generation_state",
     "coerce_generation_results",
     "load_integration_components",

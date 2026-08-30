@@ -12,9 +12,11 @@ import argparse
 import asyncio
 import inspect
 import math
+import os
 import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import torch
@@ -354,6 +356,9 @@ async def run_daytona_training(
     learning_rate: float = LEARNING_RATE,
     max_grad_norm: float = MAX_GRAD_NORM,
     checkpoint_dir: str | Path = "checkpoints",
+    start_generation: int = 0,
+    initial_policy_version: int = 0,
+    policy_checkpoint: str | Path | None = None,
     snapshot_name: str | None = None,
     keep_sandboxes: bool = False,
     event_callback: LifecycleCallback | None = None,
@@ -371,6 +376,20 @@ async def run_daytona_training(
     generations = _positive_int(generations, "generations")
     worlds = _positive_int(worlds, "worlds")
     max_steps = _positive_int(max_steps, "max_steps")
+    start_generation = _non_negative_int(start_generation, "start_generation")
+    initial_policy_version = _non_negative_int(
+        initial_policy_version,
+        "initial_policy_version",
+    )
+    if start_generation != initial_policy_version:
+        raise ValueError(
+            "start_generation and initial_policy_version must match for the "
+            "one-generation-per-policy demo contract"
+        )
+    if start_generation == 0 and policy_checkpoint is not None:
+        raise ValueError("a fresh v0 run must not supply policy_checkpoint")
+    if start_generation > 0 and policy_checkpoint is None:
+        raise ValueError("a resumed vN run requires policy_checkpoint")
     observation_dimension = _resolve_observation_dim(obs_dim)
 
     # Both imports stay inside the real async training entry point.  Importing
@@ -384,21 +403,33 @@ async def run_daytona_training(
             "rl_policy is required for Daytona training; install project dependencies"
         ) from exc
 
-    model = create_policy(observation_dimension, seed=int(base_seed))
-    initialize_uniform_policy_v0(model)
-    optimizer = create_optimizer(model, learning_rate)
     checkpoint_root = Path(checkpoint_dir)
-    _save_checkpoint(
-        checkpoint_root / "policy_v000.pt",
-        model=model,
-        optimizer=optimizer,
-        policy_version=0,
-        obs_dim=observation_dimension,
-    )
+    model = create_policy(observation_dimension, seed=int(base_seed))
+    optimizer = create_optimizer(model, learning_rate)
+    if start_generation == 0:
+        initialize_uniform_policy_v0(model)
+        input_checkpoint_path = checkpoint_root / "policy_v000.pt"
+        _save_checkpoint(
+            input_checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            policy_version=0,
+            obs_dim=observation_dimension,
+        )
+    else:
+        input_checkpoint_path = Path(policy_checkpoint)
+        _load_checkpoint(
+            input_checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            expected_policy_version=initial_policy_version,
+            expected_obs_dim=observation_dimension,
+        )
 
     history: list[dict[str, Any]] = []
-    for policy_version in range(generations):
-        seeds = generation_seeds(base_seed, policy_version, worlds)
+    for generation in range(start_generation, start_generation + generations):
+        policy_version = initial_policy_version + (generation - start_generation)
+        seeds = generation_seeds(base_seed, generation, worlds)
         # Frozen Daytona contract: v0 is seeded uniform exploration and must
         # carry null weights.  After its on-policy update, every learned
         # version is encoded with the safe JSON/base64 transport.
@@ -418,11 +449,12 @@ async def run_daytona_training(
             def tagged_event(
                 event: Mapping[str, Any],
                 *,
-                generation: int = policy_version,
+                generation: int = generation,
+                frozen_policy_version: int = policy_version,
             ) -> Awaitable[None] | None:
                 tagged = dict(event)
                 tagged["generation"] = generation
-                tagged["policy_version"] = generation
+                tagged["policy_version"] = frozen_policy_version
                 return event_callback(tagged)
 
             run_kwargs["event_callback"] = tagged_event
@@ -464,12 +496,13 @@ async def run_daytona_training(
         )
 
         record = {
-            "generation": policy_version,
+            "generation": generation,
             "policy_version": policy_version,
             "next_policy_version": next_version,
             "seeds": seeds,
             "curriculum_levels": curriculum_levels,
             "curriculum_max_level": max(curriculum_levels),
+            "input_checkpoint": str(input_checkpoint_path),
             "checkpoint": str(checkpoint_path),
             **generation_metrics,
             **update_metrics,
@@ -480,6 +513,7 @@ async def run_daytona_training(
             if inspect.isawaitable(callback_result):
                 await callback_result
         _print_generation(record)
+        input_checkpoint_path = checkpoint_path
 
     return history
 
@@ -709,6 +743,63 @@ def _coerce_generation_result(value: Any) -> Sequence[Rollout]:
     return value
 
 
+def _load_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    expected_policy_version: int,
+    expected_obs_dim: int,
+) -> None:
+    """Load a complete model-and-optimizer continuation checkpoint."""
+
+    if not path.is_file():
+        raise ValueError(f"policy checkpoint does not exist: {path}")
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"could not load policy checkpoint {path}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"policy checkpoint {path} must contain a mapping")
+    version = payload.get("policy_version")
+    if isinstance(version, bool) or version != int(expected_policy_version):
+        raise ValueError(
+            f"policy checkpoint {path} has version {version!r}; "
+            f"expected {expected_policy_version}"
+        )
+    obs_dim = payload.get("obs_dim")
+    if isinstance(obs_dim, bool) or obs_dim != int(expected_obs_dim):
+        raise ValueError(
+            f"policy checkpoint {path} has obs_dim {obs_dim!r}; "
+            f"expected {expected_obs_dim}"
+        )
+    model_state = payload.get("model_state_dict")
+    optimizer_state = payload.get("optimizer_state_dict")
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise ValueError(f"policy checkpoint {path} has no model_state_dict")
+    if not isinstance(optimizer_state, Mapping):
+        raise ValueError(f"policy checkpoint {path} has no optimizer_state_dict")
+    saved_optimizer_state = optimizer_state.get("state")
+    if not isinstance(saved_optimizer_state, Mapping) or not saved_optimizer_state:
+        raise ValueError(
+            f"policy checkpoint {path} has no learned optimizer state; "
+            "refusing to reset Adam during resume"
+        )
+    try:
+        model.load_state_dict(model_state, strict=True)
+        optimizer.load_state_dict(optimizer_state)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"policy checkpoint {path} is incompatible: {exc}") from exc
+    if any(not torch.isfinite(parameter).all().item() for parameter in model.parameters()):
+        raise ValueError(f"policy checkpoint {path} has non-finite model weights")
+    for state in optimizer.state.values():
+        for value in state.values():
+            if torch.is_tensor(value) and not torch.isfinite(value).all().item():
+                raise ValueError(
+                    f"policy checkpoint {path} has non-finite optimizer state"
+                )
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -718,15 +809,29 @@ def _save_checkpoint(
     obs_dim: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "policy_version": int(policy_version),
-            "obs_dim": int(obs_dim),
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        path,
-    )
+    payload = {
+        "policy_version": int(policy_version),
+        "obs_dim": int(obs_dim),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def _print_generation(record: Mapping[str, Any]) -> None:
@@ -757,6 +862,18 @@ def _positive_int(value: Any, name: str) -> int:
     return integer
 
 
+def _non_negative_int(value: Any, name: str) -> int:
+    try:
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{name} must be a non-negative integer")
+    if integer < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return integer
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train Gravity Gauntlet from real Daytona rollout generations."
@@ -771,6 +888,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--max-grad-norm", type=float, default=MAX_GRAD_NORM)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--start-generation", type=int, default=0)
+    parser.add_argument("--initial-policy-version", type=int, default=0)
+    parser.add_argument("--policy-checkpoint", type=Path)
     parser.add_argument("--snapshot-name")
     parser.add_argument("--keep-sandboxes", action="store_true")
     return parser.parse_args(argv)
@@ -791,6 +911,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 learning_rate=args.learning_rate,
                 max_grad_norm=args.max_grad_norm,
                 checkpoint_dir=args.checkpoint_dir,
+                start_generation=args.start_generation,
+                initial_policy_version=args.initial_policy_version,
+                policy_checkpoint=args.policy_checkpoint,
                 snapshot_name=args.snapshot_name,
                 keep_sandboxes=args.keep_sandboxes,
             )

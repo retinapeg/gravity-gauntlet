@@ -14,6 +14,7 @@ import json
 import math
 import operator
 import os
+import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -68,6 +69,41 @@ class DaytonaGenerationError(DaytonaExecutionError):
             for item in failures
         )
         super().__init__(f"{len(failures)} Daytona world(s) failed: {details}")
+
+
+def _configure_tls_ca_bundle() -> str | None:
+    """Select Certifi only when Python has no usable CA configuration.
+
+    Some macOS Python installations expose neither an OpenSSL CA file nor a CA
+    directory.  The Daytona SDK uses verified TLS, so in that narrow case use
+    the Certifi bundle already installed with the host SDK.  Explicit caller
+    configuration always wins, and certificate verification is never disabled.
+    """
+
+    verify_paths = ssl.get_default_verify_paths()
+    if verify_paths.cafile is not None or verify_paths.capath is not None:
+        return None
+
+    cafile_env = verify_paths.openssl_cafile_env
+    capath_env = verify_paths.openssl_capath_env
+    if cafile_env in os.environ or capath_env in os.environ:
+        return None
+
+    try:
+        import certifi
+    except ImportError as exc:
+        raise DaytonaConfigurationError(
+            "Python has no usable default CA certificates and certifi is "
+            "unavailable; install certifi to use Daytona securely"
+        ) from exc
+
+    bundle = Path(certifi.where())
+    if not bundle.is_file():
+        raise DaytonaConfigurationError(
+            "certifi did not provide a usable CA certificate bundle"
+        )
+    os.environ.setdefault(cafile_env, str(bundle))
+    return os.environ[cafile_env]
 
 
 async def run_world(
@@ -537,6 +573,7 @@ def _require_daytona() -> None:
         raise DaytonaConfigurationError(
             "DAYTONA_API_KEY is required; local rollout fallback is disabled"
         )
+    _configure_tls_ca_bundle()
 
 
 def _require_sdk_types() -> None:

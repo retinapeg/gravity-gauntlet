@@ -23,6 +23,10 @@ env/
 htmlcov/
 *.egg-info/
 
+# Generated runtime state
+runs/
+checkpoints/
+
 # Node
 node_modules/
 npm-debug.log*
