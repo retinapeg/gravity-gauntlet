@@ -270,7 +270,7 @@ class EnvironmentLearningContractTests(unittest.TestCase):
             for seed in range(24)
         }
         self.assertEqual(dimensions, {OBSERVATION_DIM})
-        self.assertEqual(OBSERVATION_DIM, 44)
+        self.assertEqual(OBSERVATION_DIM, 49)
 
     def test_minimum_clearance_uses_body_and_ship_surfaces(self) -> None:
         env = GravityEnv(seed=1, max_steps=20)

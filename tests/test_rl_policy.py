@@ -9,6 +9,7 @@ import unittest
 
 import torch
 
+from gravity_env import OBSERVATION_DIM
 from rl_policy import (
     ACTION_VECTORS,
     NUM_ACTIONS,
@@ -24,7 +25,7 @@ from rl_policy import (
 )
 
 
-OBS_DIM = 44
+OBS_DIM = OBSERVATION_DIM
 
 
 class PolicyArchitectureTests(unittest.TestCase):

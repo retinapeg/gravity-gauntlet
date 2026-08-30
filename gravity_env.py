@@ -8,7 +8,7 @@ import random
 from typing import Any, Sequence
 
 
-MAX_PLANETS = 5
+MAX_PLANETS = 6
 MAX_ASTEROIDS = 3
 ACTION_HOLD_STEPS = 4
 CURRICULUM_LEVELS = 4
@@ -25,7 +25,7 @@ ACTION_VECTORS: tuple[tuple[float, float], ...] = (
     (-_DIAGONAL, -_DIAGONAL),
 )
 
-# 7 navigation values + five 5-value planet slots + three 4-value obstacles.
+# 7 navigation values + six 5-value planet slots + three 4-value obstacles.
 OBSERVATION_DIM = 7 + MAX_PLANETS * 5 + MAX_ASTEROIDS * 4
 
 
@@ -64,7 +64,7 @@ class GravityEnv:
 
     SHIP_RADIUS = 10.0
     THRUST_ACCELERATION = 135.0
-    BASE_GRAVITY_PARAMETER = 620_000.0
+    BASE_GRAVITY_PARAMETER = 300_000.0
     GRAVITY_SOFTENING = 32.0
 
     SAFE_MARGIN = 58.0
@@ -79,7 +79,7 @@ class GravityEnv:
     OUT_OF_BOUNDS_PENALTY = -90.0
     TIMEOUT_PENALTY = -25.0
     VELOCITY_SCALE = 500.0
-    MASS_SCALE = 4.0
+    MASS_SCALE = 1.18
     RADIUS_SCALE = 80.0
     ACTION_HOLD_STEPS = ACTION_HOLD_STEPS
     OBSERVATION_DIM = OBSERVATION_DIM
@@ -88,26 +88,29 @@ class GravityEnv:
     # Seed band 0 is deliberately approachable for early policy updates;
     # successive bands add bodies and shrink the portal without scripting any
     # flight path.  Layouts, masses, and all dynamics remain seeded.
-    PLANET_COUNT_RANGES = ((1, 2), (2, 3), (2, 4), (3, 5))
-    ASTEROID_COUNT_RANGES = ((0, 0), (0, 1), (0, 2), (1, 3))
+    PLANET_COUNT_RANGES = ((4, 4), (4, 5), (5, 6), (5, 6))
+    ASTEROID_COUNT_RANGES = ((1, 1), (1, 2), (1, 3), (2, 3))
     PORTAL_RADIUS_RANGES = (
         (52.0, 60.0),
         (44.0, 52.0),
         (36.0, 44.0),
         (28.0, 36.0),
     )
-    HERO_MASS_RANGES = (
-        (1.30, 1.80),
-        (1.50, 2.05),
-        (1.65, 2.30),
-        (1.75, 2.55),
+    PLANET_RADIUS_RANGES = (
+        (20.0, 34.0),
+        (20.0, 38.0),
+        (21.0, 42.0),
+        (22.0, 45.0),
     )
-    HERO_OFFSET_RANGES = (
-        (135.0, 185.0),
-        (125.0, 178.0),
-        (115.0, 172.0),
-        (105.0, 168.0),
-    )
+    MIN_PLANET_RADIUS = 20.0
+    MAX_PLANET_RADIUS = 45.0
+    PLANET_MASS_VARIATION = (0.96, 1.04)
+    MIN_PLANET_MASS = 0.63
+    MAX_PLANET_MASS = 1.18
+    MIN_RADIUS_MASS = 0.66
+    MAX_RADIUS_MASS = 1.12
+    PLANET_ARENA_X_RANGE = (200.0, WIDTH - 200.0)
+    PLANET_GRAVITY_RADIUS_MULTIPLIER = (2.2, 2.8)
 
     PLANET_COLOURS = (
         (255, 105, 120),
@@ -465,96 +468,68 @@ class GravityEnv:
             (self.portal["position"], self.portal["radius"]),
         ]
 
-        # Every universe receives a strong but safely offset "hero" gravity
-        # well near the broad start-to-portal corridor. Its side and exact
-        # placement are seeded, so this creates varied slingshot choices rather
-        # than a hard-coded racetrack.
-        hero_radius = rng.uniform(49.0, 67.0)
-        start_x, start_y = self.ship_position
-        portal_x, portal_y = self.portal["position"]
-        corridor_x = portal_x - start_x
-        corridor_y = portal_y - start_y
-        corridor_length = max(1.0, math.hypot(corridor_x, corridor_y))
-        along = rng.uniform(0.40, 0.64)
-        side = rng.choice((-1.0, 1.0))
-        offset = rng.uniform(*self.HERO_OFFSET_RANGES[self.curriculum_level]) * side
-        hero_position = [
-            start_x + corridor_x * along - corridor_y / corridor_length * offset,
-            start_y + corridor_y * along + corridor_x / corridor_length * offset,
-        ]
-        hero_position[0] = max(hero_radius + 75.0, min(self.width - hero_radius - 75.0, hero_position[0]))
-        hero_position[1] = max(hero_radius + 65.0, min(self.height - hero_radius - 65.0, hero_position[1]))
-        if min(
-            math.dist(hero_position, position) - hero_radius - radius
-            for position, radius in occupied
-        ) < 60.0:
-            hero_position = self._sample_clear_position(
-                rng,
-                (315.0, self.width - 300.0),
-                (hero_radius + 70.0, self.height - hero_radius - 70.0),
-                hero_radius,
-                occupied,
-                60.0,
-            )
-        hero_mass = (
-            rng.uniform(*self.HERO_MASS_RANGES[self.curriculum_level])
-            * (hero_radius / 56.0) ** 2
-        )
-        self.planets = [
-            {
-                "position": hero_position,
-                "radius": hero_radius,
-                "mass": hero_mass,
-                "gm": self.BASE_GRAVITY_PARAMETER * hero_mass,
-                "gravity_radius": max(245.0, hero_radius * rng.uniform(4.1, 4.8)),
-                "colour": list(rng.choice(self.PLANET_COLOURS)),
-                "index": 0,
-                "hero": True,
-            }
-        ]
-        occupied.append((hero_position, hero_radius))
-
         planet_count = rng.randint(*self.PLANET_COUNT_RANGES[self.curriculum_level])
-        for index in range(1, planet_count):
-            radius = rng.uniform(32.0, 58.0)
+        arena_x_min, arena_x_max = self.PLANET_ARENA_X_RANGE
+        band_width = (arena_x_max - arena_x_min) / planet_count
+        vertical_sides = [index % 2 for index in range(planet_count)]
+        rng.shuffle(vertical_sides)
+        self.planets = []
+        for index in range(planet_count):
+            radius_range = self.PLANET_RADIUS_RANGES[self.curriculum_level]
+            radius = rng.uniform(*radius_range)
+            band_left = arena_x_min + index * band_width
+            band_right = band_left + band_width
+            y_range = (
+                (radius + 60.0, self.height * 0.55)
+                if vertical_sides[index] == 0
+                else (self.height * 0.45, self.height - radius - 60.0)
+            )
             position = self._sample_clear_position(
                 rng,
-                (250.0, self.width - 220.0),
-                (radius + 55.0, self.height - radius - 55.0),
+                (band_left + 10.0, band_right - 10.0),
+                y_range,
                 radius,
                 occupied,
                 self.SAFE_MARGIN,
             )
-            mass = rng.uniform(0.68, 1.28) * (radius / 45.0) ** 2
+            radius_fraction = (
+                radius - self.MIN_PLANET_RADIUS
+            ) / (
+                self.MAX_PLANET_RADIUS - self.MIN_PLANET_RADIUS
+            )
+            radius_mass = self.MIN_RADIUS_MASS + radius_fraction * (
+                self.MAX_RADIUS_MASS - self.MIN_RADIUS_MASS
+            )
+            mass = min(
+                self.MAX_PLANET_MASS,
+                max(
+                    self.MIN_PLANET_MASS,
+                    radius_mass * rng.uniform(*self.PLANET_MASS_VARIATION),
+                ),
+            )
             self.planets.append(
                 {
                     "position": position,
                     "radius": radius,
                     "mass": mass,
                     "gm": self.BASE_GRAVITY_PARAMETER * mass,
-                    "gravity_radius": max(150.0, radius * rng.uniform(3.2, 4.0)),
+                    # Renderer hint only; gravity_at() uses the Newtonian field
+                    # above without an influence cutoff or display multiplier.
+                    "gravity_radius": max(
+                        80.0,
+                        radius
+                        * rng.uniform(*self.PLANET_GRAVITY_RADIUS_MULTIPLIER),
+                    ),
                     "colour": list(rng.choice(self.PLANET_COLOURS)),
                     "index": index,
-                    "hero": False,
                 }
             )
             occupied.append((position, radius))
 
-        # Keep the corridor well visually and dynamically dominant even when a
-        # regular planet happens to draw its largest mass parameters.
-        strongest_regular_mass = max(
-            (float(planet["mass"]) for planet in self.planets[1:]),
-            default=0.0,
-        )
-        minimum_hero_mass = strongest_regular_mass * 1.20
-        if float(self.planets[0]["mass"]) < minimum_hero_mass:
-            self.planets[0]["mass"] = minimum_hero_mass
-            self.planets[0]["gm"] = self.BASE_GRAVITY_PARAMETER * minimum_hero_mass
-
         self.asteroids = []
         asteroid_count = rng.randint(*self.ASTEROID_COUNT_RANGES[self.curriculum_level])
         for index in range(asteroid_count):
-            radius = rng.uniform(12.0, 22.0)
+            radius = rng.uniform(10.0, 18.0)
             position = self._sample_clear_position(
                 rng,
                 (205.0, self.width - 115.0),
