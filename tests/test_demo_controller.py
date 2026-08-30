@@ -19,11 +19,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 from gravity_gauntlet.demo_controller import (
     IntegrationComponents,
     IntegrationContractError,
     LifecycleCollector,
     build_generation_state,
+    checkpoint_model_digest,
     coerce_generation_results,
     run_training_demo,
     save_generation_json,
@@ -39,6 +42,30 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 POLICY_VERSION = 4
 SEEDS = [18_873 + index for index in range(8)]
+
+
+def write_fixture_checkpoint(
+    path: Path,
+    *,
+    policy_version: int,
+    weight_value: float | None = None,
+) -> None:
+    """Write a tiny trainer-shaped checkpoint for controller contract tests."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "policy_version": policy_version,
+            "obs_dim": 2,
+            "model_state_dict": {
+                "fixture.weight": torch.tensor(
+                    [float(policy_version) if weight_value is None else weight_value]
+                )
+            },
+            "optimizer_state_dict": {},
+        },
+        path,
+    )
 
 
 def fixture_rollout(index: int) -> dict[str, object]:
@@ -168,6 +195,7 @@ class GenerationMetricsTests(unittest.TestCase):
 
         self.assertEqual(decoded["generation"], 4)
         self.assertEqual(decoded["policy_version"], 4)
+        self.assertEqual(decoded["policy_version_used"], 4)
         self.assertEqual(decoded["next_policy_version"], 5)
         self.assertEqual(decoded["world_count"], 8)
         self.assertEqual(len(decoded["rollouts"]), 8)
@@ -177,6 +205,8 @@ class GenerationMetricsTests(unittest.TestCase):
         )
         self.assertEqual(decoded["rollouts"][0]["generation"], 4)
         self.assertEqual(decoded["rollouts"][0]["actions"], [1, 2])
+        self.assertEqual(decoded["worlds"][0]["steps"], 3)
+        self.assertEqual(decoded["rollouts"][0]["steps"], 3)
         self.assertEqual(decoded["champion"]["sandbox_id"], "fixture-sandbox-8")
         self.assertEqual(decoded["champion"]["actions"], [8, 0])
         self.assertEqual(decoded["champion"]["policy_version"], 4)
@@ -450,12 +480,12 @@ class LifecycleAndHistoryTests(unittest.TestCase):
         self.assertEqual(attempts[0].policy_version, 2)
         self.assertEqual(attempts[0].points, ((10.0, 1.0), (20.0, 2.0)))
 
-    def test_current_daytona_contract_verifies_its_recorded_universe(self) -> None:
+    def test_fixture_replay_validates_geometry_without_claiming_daytona(self) -> None:
         from gravity_env import GravityEnv
         from visual_demo import _replay_environment, load_rollout_trails
 
         seed = 77
-        sandbox_id = "sandbox-release-proof-77"
+        sandbox_id = "fixture-sandbox-release-proof-77"
         result = fixture_rollout(1)
         result.update(
             {
@@ -488,9 +518,9 @@ class LifecycleAndHistoryTests(unittest.TestCase):
             results=[result],
             lifecycle_events=lifecycle,
             next_policy_version=1,
-            execution_backend="daytona",
+            execution_backend="fixture",
             extra={
-                "execution_backend": "daytona",
+                "execution_backend": "fixture",
                 "seed_batch": [seed],
                 "trainer_checkpoint": "checkpoints/policy_v001.pt",
                 "training": {"loss": 0.25},
@@ -501,8 +531,8 @@ class LifecycleAndHistoryTests(unittest.TestCase):
             attempts = load_rollout_trails(save_generation_json(state, directory))
 
         self.assertEqual(len(attempts), 1)
-        self.assertTrue(attempts[0].daytona_verified)
-        self.assertEqual(attempts[0].provenance, "DAYTONA TRAINING")
+        self.assertFalse(attempts[0].daytona_verified)
+        self.assertEqual(attempts[0].provenance, "UNVERIFIED RECORDED REPLAY")
         self.assertEqual(
             _replay_environment(attempts[0]).universe_dict(),
             result["universe"],
@@ -523,11 +553,16 @@ class FixtureBoundaryTests(unittest.TestCase):
         *,
         fail_daytona: bool = False,
         incomplete_daytona: bool = False,
+        unchanged_weights: bool = False,
+        record_generation_delta: int = 0,
+        record_seed_delta: int = 0,
     ) -> IntegrationComponents:
         async def run_daytona_training(**kwargs: object) -> list[dict[str, object]]:
             checkpoint_dir = Path(kwargs["checkpoint_dir"])
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            (checkpoint_dir / "policy_v000.pt").write_bytes(b"fixture-v0")
+            write_fixture_checkpoint(
+                checkpoint_dir / "policy_v000.pt",
+                policy_version=0,
+            )
             events.append("daytona_called")
             if fail_daytona:
                 raise RuntimeError("fixture Daytona failure")
@@ -581,12 +616,18 @@ class FixtureBoundaryTests(unittest.TestCase):
                 events.append("trainer_updated")
                 next_version = policy_version + 1
                 checkpoint = checkpoint_dir / f"policy_v{next_version:03d}.pt"
-                checkpoint.write_bytes(f"fixture-v{next_version}".encode("ascii"))
+                write_fixture_checkpoint(
+                    checkpoint,
+                    policy_version=next_version,
+                    weight_value=(
+                        float(policy_version) if unchanged_weights else None
+                    ),
+                )
                 record: dict[str, object] = {
-                    "generation": generation,
+                    "generation": generation + record_generation_delta,
                     "policy_version": policy_version,
                     "next_policy_version": next_version,
-                    "seeds": seeds,
+                    "seeds": [seed + record_seed_delta for seed in seeds],
                     "checkpoint": str(checkpoint),
                     "worlds": len(results),
                     "episodes": len(results),
@@ -628,6 +669,14 @@ class FixtureBoundaryTests(unittest.TestCase):
             self.assertTrue(generation_path.is_file())
             self.assertTrue(initial_checkpoint.is_file())
             self.assertTrue(next_checkpoint.is_file())
+            input_digest = checkpoint_model_digest(
+                initial_checkpoint,
+                expected_policy_version=0,
+            )
+            next_digest = checkpoint_model_digest(
+                next_checkpoint,
+                expected_policy_version=1,
+            )
             payload = json.loads(generation_path.read_text(encoding="utf-8"))
 
         self.assertEqual(events.count("daytona_called"), 1)
@@ -636,8 +685,101 @@ class FixtureBoundaryTests(unittest.TestCase):
         self.assertEqual(payload["policy_version"], 0)
         self.assertEqual(payload["next_policy_version"], 1)
         self.assertEqual(payload["extra"]["training"]["episodes"], 2)
-        self.assertEqual(payload["extra"]["execution_backend"], "daytona")
+        self.assertEqual(payload["extra"]["execution_backend"], "fixture")
+        self.assertEqual(
+            {world["execution_backend"] for world in payload["worlds"]},
+            {"fixture"},
+        )
+        self.assertNotEqual(input_digest, next_digest)
+        self.assertEqual(
+            payload["extra"]["policy_update"],
+            {
+                "input_checkpoint": str(initial_checkpoint),
+                "next_checkpoint": str(next_checkpoint),
+                "input_model_sha256": input_digest,
+                "next_model_sha256": next_digest,
+                "weights_changed": True,
+            },
+        )
         self.assertTrue(all(world["actions"] for world in payload["worlds"]))
+
+    def test_unchanged_policy_weights_are_not_renamed_or_persisted(self) -> None:
+        events: list[str] = []
+        components = self._components(events, unchanged_weights=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    IntegrationContractError,
+                    "unchanged model weights",
+                ):
+                    asyncio.run(
+                        run_training_demo(
+                            generations=1,
+                            worlds=2,
+                            max_steps=5,
+                            obs_dim=2,
+                            runs_dir=root / "runs",
+                            checkpoint_dir=root / "checkpoints",
+                            components=components,
+                            echo_lifecycle=False,
+                        )
+                    )
+            self.assertFalse((root / "runs" / "generation_000.json").exists())
+
+    def test_trainer_record_generation_and_seed_identity_are_enforced(self) -> None:
+        cases = (
+            ({"record_generation_delta": 1}, "generation identity is out of order"),
+            ({"record_seed_delta": 1}, "seeds do not match"),
+        )
+        for component_options, message in cases:
+            with self.subTest(component_options=component_options):
+                events: list[str] = []
+                components = self._components(events, **component_options)
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(IntegrationContractError, message):
+                            asyncio.run(
+                                run_training_demo(
+                                    generations=1,
+                                    worlds=2,
+                                    max_steps=5,
+                                    obs_dim=2,
+                                    runs_dir=root / "runs",
+                                    checkpoint_dir=root / "checkpoints",
+                                    components=components,
+                                    echo_lifecycle=False,
+                                )
+                            )
+                    self.assertFalse(
+                        (root / "runs" / "generation_000.json").exists()
+                    )
+
+    def test_more_generations_than_history_limit_complete_successfully(self) -> None:
+        events: list[str] = []
+        components = self._components(events)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                training = asyncio.run(
+                    run_training_demo(
+                        generations=13,
+                        worlds=1,
+                        max_steps=5,
+                        obs_dim=2,
+                        runs_dir=root / "runs",
+                        checkpoint_dir=root / "checkpoints",
+                        components=components,
+                        echo_lifecycle=False,
+                    )
+                )
+
+            self.assertEqual(training.current_generation, 12)
+            self.assertEqual(training.current_policy_version, 13)
+            self.assertEqual(training.total_worlds_run, 13)
+            self.assertEqual(len(training.recent_generations), 12)
+            self.assertTrue((root / "runs" / "generation_012.json").is_file())
 
     def test_fixture_daytona_failure_never_trains_or_saves_generation(self) -> None:
         events: list[str] = []

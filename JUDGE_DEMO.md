@@ -18,7 +18,7 @@ physics, rollout, worker-bridge, and policy files:
 python3 -m pip install -r requirements.txt
 python3 -m pip install daytona==0.207.0
 python3 daytona_snapshot.py \
-  --snapshot-name gravity-gauntlet-worker-v2
+  --snapshot-name gravity-gauntlet-worker-v3
 ```
 
 Run one complete training generation—one frozen policy across eight real,
@@ -30,7 +30,7 @@ PYTHONPATH=src:. python3 -m gravity_gauntlet.demo_controller \
   --generations 1 \
   --max-steps 500 \
   --base-seed 18473 \
-  --snapshot-name gravity-gauntlet-worker-v2
+  --snapshot-name gravity-gauntlet-worker-v3
 ```
 
 Load the saved real trajectories and replay the highest-reward rollout first,
@@ -54,7 +54,7 @@ generation and does not own a second policy/version loop.
 
 ## Demo flow
 
-“TRAIN NEXT GENERATION” means running the controller command above:
+One controller invocation performs this complete generation flow:
 
 ```text
 one v0-null or v1+-encoded policy frozen by trainer.py
@@ -103,7 +103,7 @@ PYTHONPATH=src:. python3 -m gravity_gauntlet.demo_controller \
   --generations 4 \
   --max-steps 500 \
   --base-seed 18473 \
-  --snapshot-name gravity-gauntlet-worker-v2 \
+  --snapshot-name gravity-gauntlet-worker-v3 \
   --runs-dir runs/progression \
   --checkpoint-dir checkpoints/progression
 ```
@@ -115,6 +115,11 @@ champion by default, and shows up to eight parallel worlds using each world's
 own seed. Before drawing, it compares every recorded worker `universe` with the
 current `GravityEnv(seed)` and refuses a stale-snapshot geometry mismatch. It
 does not mix metrics or trajectories across generations in one panel.
+
+Checkpoint resume is not implemented yet. Do not rerun a one-generation
+command and describe it as continuing v1: the controller deliberately refuses
+existing targets, and `--overwrite` starts again from v0. Use one uninterrupted
+`--generations N` invocation for genuine v0 → v1 → ... progression.
 
 ## 30-second pitch
 
@@ -136,7 +141,7 @@ python3 daytona_orchestrator.py \
   --base-seed 18473 \
   --policy-version 0 \
   --max-steps 50 \
-  --snapshot-name gravity-gauntlet-worker-v2
+  --snapshot-name gravity-gauntlet-worker-v3
 ```
 
 ### Two-world full E2E smoke
@@ -148,12 +153,17 @@ PYTHONPATH=src:. python3 scripts/e2e_smoke.py \
   --worlds 2 \
   --max-steps 50 \
   --base-seed 18473 \
-  --snapshot-name gravity-gauntlet-worker-v2
+  --snapshot-name gravity-gauntlet-worker-v3
 ```
 
 Smoke artifacts are isolated under `runs/e2e_smoke/` and
 `checkpoints/e2e_smoke/`, so they cannot overwrite the full judge run. A
 repeat run refuses existing targets unless `--overwrite` is supplied.
+The smoke test loads both checkpoints, hashes only their `model_state_dict`
+tensors, fails if the policy weights are unchanged, and checks that the saved
+generation carries the same two digests as its update proof. Its final gate
+loads that saved JSON through `visual_demo.py`'s loader, requires every world
+to retain verified Daytona provenance, and requires exactly one real champion.
 
 ### Eight-world Daytona baseline generation
 
@@ -163,7 +173,7 @@ python3 daytona_orchestrator.py \
   --base-seed 18473 \
   --policy-version 0 \
   --max-steps 500 \
-  --snapshot-name gravity-gauntlet-worker-v2
+  --snapshot-name gravity-gauntlet-worker-v3
 ```
 
 ### One eight-world training generation
@@ -174,7 +184,7 @@ PYTHONPATH=src:. python3 -m gravity_gauntlet.demo_controller \
   --generations 1 \
   --max-steps 500 \
   --base-seed 18473 \
-  --snapshot-name gravity-gauntlet-worker-v2
+  --snapshot-name gravity-gauntlet-worker-v3
 ```
 
 ### Visual demo

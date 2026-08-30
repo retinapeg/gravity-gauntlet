@@ -21,6 +21,7 @@ from gravity_gauntlet.demo_controller import (
     DEFAULT_BASE_SEED,
     IntegrationContractError,
     IntegrationUnavailableError,
+    checkpoint_model_digest,
     run_training_demo,
 )
 
@@ -143,6 +144,25 @@ async def run_smoke(args: argparse.Namespace) -> Path:
         raise SmokeFailure("trainer did not save the v0 and updated policy checkpoints")
     if generation.extra.get("trainer_checkpoint") != str(next_checkpoint_path):
         raise SmokeFailure("generation metadata does not identify its trainer checkpoint")
+    initial_digest = checkpoint_model_digest(
+        initial_checkpoint_path,
+        expected_policy_version=generation.policy_version,
+    )
+    next_digest = checkpoint_model_digest(
+        next_checkpoint_path,
+        expected_policy_version=generation.next_policy_version,
+    )
+    if initial_digest == next_digest:
+        raise SmokeFailure("trainer incremented the version without changing model weights")
+    update_proof = generation.extra.get("policy_update")
+    if not isinstance(update_proof, Mapping):
+        raise SmokeFailure("generation has no model-weight update proof")
+    if (
+        update_proof.get("weights_changed") is not True
+        or update_proof.get("input_model_sha256") != initial_digest
+        or update_proof.get("next_model_sha256") != next_digest
+    ):
+        raise SmokeFailure("generation model-weight proof does not match its checkpoints")
 
     output_path = Path(args.runs_dir) / "generation_000.json"
     if not output_path.is_file():
@@ -152,6 +172,21 @@ async def run_smoke(args: argparse.Namespace) -> Path:
         raise SmokeFailure("saved generation JSON has the wrong world count")
     if not saved.get("champion", {}).get("sandbox_id"):
         raise SmokeFailure("saved generation JSON has no real champion sandbox ID")
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    from visual_demo import load_rollout_trails
+
+    attempts = load_rollout_trails(output_path)
+    if len(attempts) != args.worlds:
+        raise SmokeFailure("visual loader did not receive every Daytona world")
+    if not all(attempt.daytona_verified for attempt in attempts):
+        raise SmokeFailure("visual loader did not verify Daytona provenance")
+    champions = [attempt for attempt in attempts if attempt.is_champion]
+    if (
+        len(champions) != 1
+        or champions[0].sandbox_id
+        != saved["champion"]["sandbox_id"]
+    ):
+        raise SmokeFailure("visual loader did not preserve the real champion")
     return output_path
 
 

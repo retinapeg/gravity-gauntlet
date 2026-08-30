@@ -15,6 +15,7 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
 import inspect
 import json
 import math
@@ -54,6 +55,7 @@ class IntegrationComponents:
     """The one canonical trainer entry point used by the glue layer."""
 
     run_daytona_training: Callable[..., Any]
+    execution_backend: str = "fixture"
 
 
 class LifecycleCollector:
@@ -133,7 +135,10 @@ def load_integration_components() -> IntegrationComponents:
             "trainer.run_daytona_training is not callable"
         )
 
-    return IntegrationComponents(run_daytona_training=run_daytona_training)
+    return IntegrationComponents(
+        run_daytona_training=run_daytona_training,
+        execution_backend="daytona",
+    )
 
 
 def validate_generation_seeds(
@@ -603,6 +608,135 @@ def save_training_state_json(
     return output_path
 
 
+def checkpoint_model_digest(
+    path: str | Path,
+    *,
+    expected_policy_version: int,
+) -> str:
+    """Hash only the learned model tensors in one trainer checkpoint.
+
+    File hashes are insufficient proof of learning because version metadata or
+    optimizer state can change while policy weights remain identical.  This
+    helper loads the trainer's safe checkpoint payload and hashes tensor names,
+    dtypes, shapes, and bytes from ``model_state_dict`` only.
+    """
+
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise IntegrationContractError(
+            f"policy checkpoint does not exist: {checkpoint_path}"
+        )
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - trainer already requires torch
+        raise IntegrationUnavailableError(
+            "PyTorch is required to verify policy checkpoint weights"
+        ) from exc
+
+    try:
+        payload = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except Exception as exc:
+        raise IntegrationContractError(
+            f"could not read policy checkpoint {checkpoint_path}: {exc}"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise IntegrationContractError(
+            f"policy checkpoint {checkpoint_path} must contain a mapping"
+        )
+    version = payload.get("policy_version")
+    if isinstance(version, bool) or version != expected_policy_version:
+        raise IntegrationContractError(
+            f"policy checkpoint {checkpoint_path} has version {version!r}; "
+            f"expected {expected_policy_version}"
+        )
+    model_state = payload.get("model_state_dict")
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise IntegrationContractError(
+            f"policy checkpoint {checkpoint_path} has no model_state_dict"
+        )
+
+    digest = hashlib.sha256()
+    for name in sorted(model_state, key=str):
+        tensor = model_state[name]
+        if not torch.is_tensor(tensor):
+            raise IntegrationContractError(
+                f"policy checkpoint tensor {name!r} is not a tensor"
+            )
+        # Clone into an exact contiguous CPU storage so raw bytes can be
+        # hashed without NumPy (the project's lean virtualenv does not require
+        # it).
+        value = tensor.detach().cpu().contiguous().clone()
+        descriptor = json.dumps(
+            {
+                "name": str(name),
+                "dtype": str(value.dtype),
+                "shape": list(value.shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(descriptor).to_bytes(8, "big"))
+        digest.update(descriptor)
+        raw = bytes(value.untyped_storage())
+        expected_bytes = value.numel() * value.element_size()
+        if len(raw) != expected_bytes:
+            raise IntegrationContractError(
+                f"policy checkpoint tensor {name!r} has unexpected storage size"
+            )
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def verify_policy_checkpoint_update(
+    *,
+    checkpoint_dir: str | Path,
+    policy_version: int,
+    next_policy_version: int,
+    trainer_checkpoint: Any,
+) -> dict[str, Any]:
+    """Return JSON proof that vN and vN+1 contain different model weights."""
+
+    checkpoint_root = Path(checkpoint_dir)
+    input_path = checkpoint_root / f"policy_v{policy_version:03d}.pt"
+    expected_next_path = checkpoint_root / f"policy_v{next_policy_version:03d}.pt"
+    if not isinstance(trainer_checkpoint, (str, os.PathLike)):
+        raise IntegrationContractError(
+            "trainer generation record has no checkpoint path"
+        )
+    reported_next_path = Path(trainer_checkpoint)
+    if reported_next_path.resolve() != expected_next_path.resolve():
+        raise IntegrationContractError(
+            "trainer checkpoint path does not match the next policy version: "
+            f"{reported_next_path} != {expected_next_path}"
+        )
+
+    input_digest = checkpoint_model_digest(
+        input_path,
+        expected_policy_version=policy_version,
+    )
+    next_digest = checkpoint_model_digest(
+        expected_next_path,
+        expected_policy_version=next_policy_version,
+    )
+    if input_digest == next_digest:
+        raise IntegrationContractError(
+            f"REINFORCE produced unchanged model weights for policy "
+            f"v{policy_version} -> v{next_policy_version}; refusing to rename "
+            "an unchanged policy"
+        )
+    return {
+        "input_checkpoint": str(input_path),
+        "next_checkpoint": str(expected_next_path),
+        "input_model_sha256": input_digest,
+        "next_model_sha256": next_digest,
+        "weights_changed": True,
+    }
+
+
 async def run_training_demo(
     *,
     generations: int = DEFAULT_GENERATIONS,
@@ -651,6 +785,16 @@ async def run_training_demo(
                 "created because local fallback is disabled"
             ) from exc
     loaded = components or load_integration_components()
+    execution_backend = loaded.execution_backend
+    if not isinstance(execution_backend, str) or not execution_backend.strip():
+        raise IntegrationContractError(
+            "integration component must declare a non-empty execution backend"
+        )
+    execution_backend = execution_backend.strip().lower()
+    if components is None and execution_backend != "daytona":
+        raise IntegrationContractError(
+            "the production controller must use the Daytona execution backend"
+        )
 
     _preflight_output_paths(
         runs_dir=Path(runs_dir),
@@ -664,6 +808,7 @@ async def run_training_demo(
     )
     lifecycle = LifecycleCollector(echo=echo_lifecycle)
     validated: dict[int, tuple[list[int], list[Mapping[str, Any]]]] = {}
+    persisted_identities: list[dict[str, Any]] = []
 
     def validate_before_update(
         policy_version: int,
@@ -678,7 +823,12 @@ async def run_training_demo(
             expected_seeds=seed_values,
             expected_policy_version=policy_version,
         )
-        validated[int(policy_version)] = (seed_values, rollout_values)
+        version = int(policy_version)
+        if version in validated:
+            raise IntegrationContractError(
+                f"trainer validated policy v{version} more than once"
+            )
+        validated[version] = (seed_values, rollout_values)
 
     def persist_after_update(
         record: Mapping[str, Any],
@@ -691,6 +841,13 @@ async def run_training_demo(
         next_policy_version = _positive_int(
             record.get("next_policy_version"), "next_policy_version"
         )
+        expected_generation = len(persisted_identities)
+        if generation != expected_generation or policy_version != generation:
+            raise IntegrationContractError(
+                "trainer generation identity is out of order: "
+                f"generation={generation}, policy_version={policy_version}, "
+                f"expected={expected_generation}"
+            )
         if next_policy_version != policy_version + 1:
             raise IntegrationContractError(
                 "trainer policy version must advance exactly once per generation"
@@ -700,10 +857,26 @@ async def run_training_demo(
                 f"trainer persisted policy v{policy_version} without validated rollouts"
             )
         seeds, validated_rollouts = validated.pop(policy_version)
+        recorded_seeds = validate_generation_seeds(
+            record.get("seeds"),
+            worlds=worlds,
+        )
+        if recorded_seeds != seeds:
+            raise IntegrationContractError(
+                "trainer generation record seeds do not match the validated "
+                "Daytona rollout seed batch"
+            )
         if list(rollouts) != validated_rollouts:
             raise IntegrationContractError(
                 "trainer changed rollout structures between validation and persistence"
             )
+
+        policy_update = verify_policy_checkpoint_update(
+            checkpoint_dir=checkpoint_dir,
+            policy_version=policy_version,
+            next_policy_version=next_policy_version,
+            trainer_checkpoint=record.get("checkpoint"),
+        )
 
         training_fields = {
             key: value
@@ -724,18 +897,19 @@ async def run_training_demo(
             results=validated_rollouts,
             lifecycle_events=lifecycle.as_dict(generation=generation),
             next_policy_version=next_policy_version,
-            execution_backend="daytona",
+            execution_backend=execution_backend,
             extra={
-                "execution_backend": "daytona",
+                "execution_backend": execution_backend,
                 "seed_batch": seeds,
                 "trainer_checkpoint": record.get("checkpoint"),
                 "training": json_safe(training_fields),
+                "policy_update": policy_update,
             },
         )
         incomplete_worlds = [
             world.world_index
             for world in generation_state.worlds
-            if world.execution_backend != "daytona"
+            if world.execution_backend != execution_backend
             or world.sandbox_id is None
             or world.reward is None
             or len(world.trajectory) < 2
@@ -749,7 +923,8 @@ async def run_training_demo(
         ]
         if generation_state.status != "COMPLETE" or incomplete_worlds:
             raise IntegrationContractError(
-                "Daytona generation did not provide complete sandbox/lifecycle/"
+                f"{execution_backend} generation did not provide complete "
+                "sandbox/lifecycle/"
                 "trajectory/action proof for every world; the trained generation "
                 f"was not persisted (incomplete worlds: {incomplete_worlds})"
             )
@@ -757,6 +932,14 @@ async def run_training_demo(
         generation_path = save_generation_json(generation_state, runs_dir)
         training_state.add_generation(generation_state)
         save_training_state_json(training_state, runs_dir)
+        persisted_identities.append(
+            {
+                "generation": generation,
+                "policy_version": policy_version,
+                "next_policy_version": next_policy_version,
+                "seeds": list(seeds),
+            }
+        )
         _print_generation_result(generation_state, generation_path)
 
     try:
@@ -783,14 +966,49 @@ async def run_training_demo(
             f"used: {type(exc).__name__}: {exc}"
         ) from exc
 
-    if not isinstance(history, Sequence) or len(history) != generations:
+    if (
+        isinstance(history, (str, bytes, Mapping))
+        or not isinstance(history, Sequence)
+        or len(history) != generations
+    ):
         raise IntegrationContractError(
             "trainer did not return one completed record per requested generation"
         )
-    if len(training_state.recent_generations) != generations:
+    if len(persisted_identities) != generations:
         raise IntegrationContractError(
             "trainer completed without persisting every validated generation"
         )
+    if validated:
+        raise IntegrationContractError(
+            "trainer completed with validated rollout batches that were never persisted"
+        )
+    for index, (returned, persisted) in enumerate(
+        zip(history, persisted_identities, strict=True)
+    ):
+        if not isinstance(returned, Mapping):
+            raise IntegrationContractError(
+                f"trainer history record {index} is not a mapping"
+            )
+        returned_identity = {
+            "generation": _non_negative_int(
+                returned.get("generation"), "generation"
+            ),
+            "policy_version": _non_negative_int(
+                returned.get("policy_version"), "policy_version"
+            ),
+            "next_policy_version": _positive_int(
+                returned.get("next_policy_version"), "next_policy_version"
+            ),
+            "seeds": validate_generation_seeds(
+                returned.get("seeds"),
+                worlds=worlds,
+            ),
+        }
+        if returned_identity != persisted:
+            raise IntegrationContractError(
+                f"trainer history record {index} does not match its persisted "
+                "generation identity"
+            )
     return training_state
 
 
@@ -809,7 +1027,12 @@ def _print_generation_result(state: GenerationState, path: Path) -> None:
     print(f"Champion seed: {champion.seed if champion is not None else 'n/a'}")
     print("\nPolicy updated:")
     print(f"v{state.policy_version} -> v{state.next_policy_version}")
-    print("Encoded weights changed: yes")
+    policy_update = state.extra.get("policy_update")
+    weights_changed = (
+        isinstance(policy_update, Mapping)
+        and policy_update.get("weights_changed") is True
+    )
+    print(f"Model weights changed: {'yes' if weights_changed else 'unverified'}")
     print("\nSaved:")
     print(path)
 

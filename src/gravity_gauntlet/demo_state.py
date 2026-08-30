@@ -289,6 +289,7 @@ class TrainingState:
             {
                 "generation": generation.generation,
                 "policy_version": generation.policy_version,
+                "policy_version_used": generation.policy_version_used,
                 "champion": generation.champion_dict(),
                 "worlds": [
                     world.visual_dict(generation=generation.generation)
