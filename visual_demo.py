@@ -1,8 +1,9 @@
-"""Colourful manual game and provenance-safe rollout replay for GravityEnv.
+"""Judge-facing, provenance-safe rollout replay for Gravity Gauntlet.
 
 All simulation and collision logic remains in ``gravity_env.py``.  This file
-either gathers keyboard input and calls ``GravityEnv.step()``, or renders exact
-recorded samples over a freshly reconstructed matching seeded universe.
+renders exact recorded samples over a freshly reconstructed matching seeded
+universe.  Its keyboard-driven development mode is always labelled
+``LOCAL PREVIEW`` and is never presented as Daytona execution.
 """
 
 from __future__ import annotations
@@ -29,8 +30,16 @@ WIDTH = 1200
 HEIGHT = 800
 FPS = 60
 TRAIL_LENGTH = 650
-REPLAY_POINTS_PER_SECOND = 240.0
+REPLAY_TARGET_SECONDS = 8.0
 REPLAY_END_HOLD_SECONDS = 2.8
+
+# Preserve the 1200:800 simulation aspect ratio while reserving a fixed right
+# column for eight judge-facing universe cards.  This is a rendering transform
+# only; recorded coordinates and physics data are never changed.
+WORLD_VIEWPORT_X = 90
+WORLD_VIEWPORT_Y = 115
+WORLD_VIEWPORT_WIDTH = 750
+WORLD_VIEWPORT_HEIGHT = 500
 
 SPACE = (3, 5, 17)
 WHITE = (232, 242, 255)
@@ -38,6 +47,13 @@ MUTED = (126, 151, 187)
 CYAN = (69, 225, 255)
 GREEN = (85, 255, 174)
 RED = (255, 70, 92)
+
+TERMINAL_LIFECYCLE_STATES = {
+    "SUCCESS",
+    "COLLISION",
+    "OUT_OF_BOUNDS",
+    "TIMEOUT",
+}
 
 PLANET_PALETTE = (
     (80, 186, 255),
@@ -64,12 +80,18 @@ class AttemptTrail:
     trajectory: tuple[dict[str, Any], ...] = ()
     action_vectors: tuple[tuple[float, float], ...] = ()
     universe: dict[str, Any] | None = None
+    lifecycle: tuple[dict[str, Any], ...] = ()
     world_index: int | None = None
     termination: str | None = None
     min_clearance: float | None = None
     mean_speed: float | None = None
     max_speed: float | None = None
-    provenance: str = "LOCAL REPLAY"
+    generation_average_reward: float | None = None
+    generation_best_reward: float | None = None
+    generation_success_rate: float | None = None
+    generation_collision_rate: float | None = None
+    generation_world_count: int | None = None
+    provenance: str = "LOCAL PREVIEW"
     daytona_verified: bool = False
     is_champion: bool = False
     champion_declared: bool = False
@@ -111,19 +133,61 @@ def _synthetic_sandbox_id(value: str) -> bool:
     return lowered.startswith(("fixture", "mock", "test", "fake", "local"))
 
 
+def _valid_action_indices(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(
+            isinstance(action, int)
+            and not isinstance(action, bool)
+            and 0 <= action <= 8
+            for action in value
+        )
+    )
+
+
+def _valid_action_vectors(value: Any, expected_count: int) -> bool:
+    if not isinstance(value, list) or len(value) != expected_count:
+        return False
+    for vector in value:
+        if not isinstance(vector, (list, tuple)) or len(vector) != 2:
+            return False
+        try:
+            x = _finite_number(vector[0], "action x")
+            y = _finite_number(vector[1], "action y")
+        except ValueError:
+            return False
+        if abs(x) > 1.0 or abs(y) > 1.0:
+            return False
+    return True
+
+
 def _controller_daytona_proof(container: dict[str, Any]) -> bool:
     """Recognise the real-only controller envelope without trusting an ID alone."""
 
     worlds = container.get("worlds")
     if container.get("status") != "COMPLETE" or not isinstance(worlds, list) or not worlds:
         return False
-    if container.get("world_count") != len(worlds):
+    declared_world_count = container.get("world_count")
+    if (
+        isinstance(declared_world_count, bool)
+        or not isinstance(declared_world_count, int)
+        or declared_world_count != len(worlds)
+    ):
         return False
+    generation = container.get("generation")
     generation_policy = container.get("policy_version")
     next_policy = container.get("next_policy_version")
     if (
-        isinstance(generation_policy, bool)
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or isinstance(generation_policy, bool)
         or not isinstance(generation_policy, int)
+        or generation_policy != generation
+        or isinstance(container.get("policy_version_used"), bool)
+        or not isinstance(container.get("policy_version_used"), int)
+        or container.get("policy_version_used") != generation_policy
         or isinstance(next_policy, bool)
         or not isinstance(next_policy, int)
         or next_policy != generation_policy + 1
@@ -135,17 +199,44 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
         "seed_batch",
         "trainer_checkpoint",
         "training",
+        "policy_update",
     }
     if not isinstance(generation_extra, dict) or not required_training_fields.issubset(
         generation_extra
     ):
         return False
+    policy_update = generation_extra.get("policy_update")
     if (
         generation_extra.get("execution_backend") != "daytona"
         or not isinstance(generation_extra.get("trainer_checkpoint"), str)
         or not generation_extra["trainer_checkpoint"]
         or not isinstance(generation_extra.get("training"), dict)
         or not generation_extra["training"]
+        or not isinstance(policy_update, dict)
+        or policy_update.get("weights_changed") is not True
+    ):
+        return False
+    input_digest = policy_update.get("input_model_sha256")
+    next_digest = policy_update.get("next_model_sha256")
+    input_checkpoint = policy_update.get("input_checkpoint")
+    next_checkpoint = policy_update.get("next_checkpoint")
+    if (
+        not isinstance(input_digest, str)
+        or not isinstance(next_digest, str)
+        or len(input_digest) != 64
+        or len(next_digest) != 64
+        or input_digest != input_digest.lower()
+        or next_digest != next_digest.lower()
+        or input_digest == next_digest
+        or any(character not in "0123456789abcdef" for character in input_digest)
+        or any(character not in "0123456789abcdef" for character in next_digest)
+        or not isinstance(input_checkpoint, str)
+        or not input_checkpoint
+        or not isinstance(next_checkpoint, str)
+        or not next_checkpoint
+        or Path(input_checkpoint).name != f"policy_v{generation_policy:03d}.pt"
+        or Path(next_checkpoint).name != f"policy_v{next_policy:03d}.pt"
+        or generation_extra.get("trainer_checkpoint") != next_checkpoint
     ):
         return False
 
@@ -180,7 +271,15 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
             world_index = _optional_integer(world.get("world_index"), "world index")
         except ValueError:
             return False
-        if world_index is None:
+        if (
+            not isinstance(world.get("seed"), int)
+            or isinstance(world.get("seed"), bool)
+            or not isinstance(world.get("policy_version"), int)
+            or isinstance(world.get("policy_version"), bool)
+            or not isinstance(world.get("world_index"), int)
+            or isinstance(world.get("world_index"), bool)
+            or world_index is None
+        ):
             return False
         world_indices.append(world_index)
         if not isinstance(world.get("trajectory"), list) or len(world["trajectory"]) < 2:
@@ -188,11 +287,9 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
         actions = world.get("actions")
         extra = world.get("extra")
         if (
-            not isinstance(actions, list)
-            or not actions
+            not _valid_action_indices(actions)
             or not isinstance(extra, dict)
-            or not isinstance(extra.get("action_vectors"), list)
-            or len(extra["action_vectors"]) != len(actions)
+            or not _valid_action_vectors(extra.get("action_vectors"), len(actions))
         ):
             return False
         try:
@@ -211,21 +308,32 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
         lifecycle = world.get("lifecycle")
         if not isinstance(lifecycle, list):
             return False
-        states: set[str] = set()
+        states: list[str] = []
         for event in lifecycle:
             if not isinstance(event, dict):
                 return False
             state = event.get("state")
+            state_name = state.upper() if isinstance(state, str) else None
             if isinstance(state, str):
-                states.add(state)
+                states.append(state_name)
             event_id = event.get("sandbox_id")
-            if event_id is not None and event_id != sandbox_id:
+            if state_name == "CREATING":
+                if event_id is not None:
+                    return False
+            elif event_id != sandbox_id:
                 return False
             event_seed = event.get("seed")
-            if event_seed is not None and event_seed != seed:
+            if event_seed != seed:
                 return False
-        if not {"LIVE", "RUNNING", "RESULT_COLLECTED"}.issubset(states):
-            return False
+            event_generation = event.get("generation")
+            if event_generation != container.get("generation"):
+                return False
+            event_policy = event.get("policy_version")
+            if event_policy != generation_policy:
+                return False
+            event_world = event.get("world")
+            if event_world != world_index:
+                return False
         expected_terminal_state = (
             "SUCCESS"
             if termination == "success"
@@ -233,7 +341,18 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
             if "collision" in termination
             else termination.upper()
         )
-        if expected_terminal_state not in states:
+        expected_states = [
+            "CREATING",
+            "LIVE",
+            "RUNNING",
+            expected_terminal_state,
+            "RESULT_COLLECTED",
+        ]
+        if (
+            expected_terminal_state not in TERMINAL_LIFECYCLE_STATES
+            or world.get("status") != expected_terminal_state
+            or states != expected_states
+        ):
             return False
 
     seed_batch = generation_extra.get("seed_batch")
@@ -248,10 +367,19 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
     except ValueError:
         return False
     champion_matches = (
-        champion.get("sandbox_id") == best_sandbox_id
+        isinstance(champion.get("seed"), int)
+        and not isinstance(champion.get("seed"), bool)
+        and isinstance(champion.get("world_index"), int)
+        and not isinstance(champion.get("world_index"), bool)
+        and isinstance(champion.get("policy_version"), int)
+        and not isinstance(champion.get("policy_version"), bool)
+        and isinstance(champion.get("generation"), int)
+        and not isinstance(champion.get("generation"), bool)
+        and champion.get("sandbox_id") == best_sandbox_id
         and champion.get("seed") == seeds[best_index]
         and champion.get("world_index") == world_indices[best_index]
         and champion.get("policy_version") == generation_policy
+        and champion.get("generation") == generation
         and math.isclose(
             champion_reward,
             rewards[best_index],
@@ -259,13 +387,45 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
             abs_tol=1.0e-9,
         )
         and champion.get("trajectory") == best_world.get("trajectory")
+        and champion.get("actions") == best_world.get("actions")
+        and champion.get("success") is best_world.get("success")
+        and champion.get("termination") == best_world.get("termination")
+        and champion.get("execution_backend") == "daytona"
     )
+    try:
+        summary_matches = (
+            math.isclose(
+                _finite_number(container.get("average_reward"), "average reward"),
+                math.fsum(rewards) / len(rewards),
+                rel_tol=1.0e-12,
+                abs_tol=1.0e-9,
+            )
+            and math.isclose(
+                _finite_number(container.get("success_rate"), "success rate"),
+                sum(bool(world.get("success")) for world in worlds) / len(worlds),
+                rel_tol=1.0e-12,
+                abs_tol=1.0e-9,
+            )
+            and math.isclose(
+                _finite_number(container.get("collision_rate"), "collision rate"),
+                sum("collision" in str(world.get("termination", "")) for world in worlds)
+                / len(worlds),
+                rel_tol=1.0e-12,
+                abs_tol=1.0e-9,
+            )
+        )
+    except ValueError:
+        return False
     return (
         len(sandbox_ids) == len(set(sandbox_ids))
         and len(seeds) == len(set(seeds))
-        and len(world_indices) == len(set(world_indices))
+        and world_indices == list(range(1, len(worlds) + 1))
+        and isinstance(seed_batch, list)
+        and all(isinstance(seed, int) and not isinstance(seed, bool) for seed in seed_batch)
         and seed_batch == seeds
         and container.get("best_sandbox_id") == best_sandbox_id
+        and isinstance(container.get("best_world"), int)
+        and not isinstance(container.get("best_world"), bool)
         and container.get("best_world") == world_indices[best_index]
         and math.isclose(
             _finite_number(container.get("best_reward"), "best reward"),
@@ -275,6 +435,7 @@ def _controller_daytona_proof(container: dict[str, Any]) -> bool:
         )
         and sandbox_ids[rewards.index(max(rewards))] == best_sandbox_id
         and champion_matches
+        and summary_matches
     )
 
 
@@ -285,7 +446,12 @@ def _raw_daytona_proof(container: dict[str, Any]) -> bool:
     results = container.get("results")
     if not isinstance(summary, dict) or not isinstance(results, list) or not results:
         return False
-    if summary.get("worlds") != len(results):
+    summary_worlds = summary.get("worlds")
+    if (
+        isinstance(summary_worlds, bool)
+        or not isinstance(summary_worlds, int)
+        or summary_worlds != len(results)
+    ):
         return False
     ids: list[str] = []
     seeds: list[int] = []
@@ -310,10 +476,8 @@ def _raw_daytona_proof(container: dict[str, Any]) -> bool:
         actions = result.get("actions")
         action_vectors = result.get("action_vectors")
         if (
-            not isinstance(actions, list)
-            or not actions
-            or not isinstance(action_vectors, list)
-            or len(action_vectors) != len(actions)
+            not _valid_action_indices(actions)
+            or not _valid_action_vectors(action_vectors, len(actions))
         ):
             return False
         try:
@@ -327,6 +491,10 @@ def _raw_daytona_proof(container: dict[str, Any]) -> bool:
         if (
             seed is None
             or policy is None
+            or not isinstance(result.get("seed"), int)
+            or isinstance(result.get("seed"), bool)
+            or not isinstance(result.get("policy_version"), int)
+            or isinstance(result.get("policy_version"), bool)
             or not isinstance(success, bool)
             or not isinstance(termination, str)
             or success != (termination == "success")
@@ -336,11 +504,38 @@ def _raw_daytona_proof(container: dict[str, Any]) -> bool:
         policies.add(policy)
         successes += int(success)
     best_sandbox = summary.get("best_sandbox")
+    try:
+        average_matches = math.isclose(
+            _finite_number(summary.get("average_reward"), "average reward"),
+            math.fsum(rewards) / len(rewards),
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-9,
+        )
+        wall_clock_seconds = _finite_number(
+            summary.get("wall_clock_seconds"), "wall clock seconds"
+        )
+    except ValueError:
+        return False
     return (
         len(ids) == len(set(ids))
         and len(seeds) == len(set(seeds))
         and len(policies) == 1
+        and isinstance(summary.get("successful"), int)
+        and not isinstance(summary.get("successful"), bool)
         and summary.get("successful") == successes
+        and isinstance(summary.get("seeds"), list)
+        and all(
+            isinstance(seed, int) and not isinstance(seed, bool)
+            for seed in summary["seeds"]
+        )
+        and summary.get("seeds") == seeds
+        and summary.get("sandbox_ids") == ids
+        and summary.get("total_trajectory_points")
+        == sum(len(result["trajectory"]) for result in results)
+        and summary.get("concurrent") is (len(results) > 1)
+        and summary.get("cleanup")
+        in {"explicit_delete_confirmed", "retained_by_request"}
+        and wall_clock_seconds >= 0.0
         and best_sandbox in ids
         and math.isclose(
             _finite_number(summary.get("best_reward"), "best reward"),
@@ -349,6 +544,7 @@ def _raw_daytona_proof(container: dict[str, Any]) -> bool:
             abs_tol=1.0e-9,
         )
         and ids[rewards.index(max(rewards))] == best_sandbox
+        and average_matches
     )
 
 
@@ -361,7 +557,7 @@ def _rollout_records(payload: Any) -> list[tuple[dict[str, Any], dict[str, Any]]
         raise ValueError("rollout JSON must be an object or list")
 
     recent = payload.get("recent_generations")
-    if isinstance(recent, list) and recent:
+    if isinstance(recent, list):
         flattened: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for index, generation in enumerate(recent):
             if not isinstance(generation, dict):
@@ -390,7 +586,8 @@ def _rollout_records(payload: Any) -> list[tuple[dict[str, Any], dict[str, Any]]
             "rollout JSON needs 'worlds', 'results', 'rollouts', or one trajectory"
         )
     if not isinstance(records, list):
-        raise ValueError(f"'{next(key for key in ('worlds', 'results', 'rollouts') if key in payload)}' must be a list")
+        key = next(key for key in ("worlds", "results", "rollouts") if key in payload)
+        raise ValueError(f"'{key}' must be a list")
 
     champion = payload.get("champion")
     champion_sandbox = payload.get("best_sandbox_id")
@@ -403,6 +600,28 @@ def _rollout_records(payload: Any) -> list[tuple[dict[str, Any], dict[str, Any]]
     if envelope_kind == "raw_daytona" and isinstance(payload.get("summary"), dict):
         champion_sandbox = payload["summary"].get("best_sandbox", champion_sandbox)
 
+    metric_source = (
+        payload.get("summary", {})
+        if envelope_kind == "raw_daytona"
+        else payload
+    )
+    if not isinstance(metric_source, dict):
+        metric_source = {}
+    success_rate = metric_source.get("success_rate")
+    successful = metric_source.get("successful")
+    metric_worlds = (
+        metric_source.get("worlds")
+        if envelope_kind == "raw_daytona"
+        else payload.get("world_count")
+    )
+    if (
+        success_rate is None
+        and isinstance(successful, int)
+        and isinstance(metric_worlds, int)
+        and metric_worlds > 0
+    ):
+        success_rate = successful / metric_worlds
+
     context = {
         "generation": payload.get("generation"),
         "policy_version": payload.get("policy_version"),
@@ -412,6 +631,11 @@ def _rollout_records(payload: Any) -> list[tuple[dict[str, Any], dict[str, Any]]
         "champion_world": champion_world,
         "envelope_kind": envelope_kind,
         "verified": verified,
+        "average_reward": metric_source.get("average_reward"),
+        "best_reward": metric_source.get("best_reward"),
+        "success_rate": success_rate,
+        "collision_rate": metric_source.get("collision_rate"),
+        "world_count": metric_worlds,
     }
     return [(record, context) for record in records]
 
@@ -464,6 +688,19 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
         success = rollout.get("success")
         if success is not None and not isinstance(success, bool):
             raise ValueError(f"rollout {index} success must be a JSON boolean")
+        termination = rollout.get("termination")
+        if termination is not None and (
+            not isinstance(termination, str) or not termination.strip()
+        ):
+            raise ValueError(f"rollout {index} termination must be non-empty text")
+        if (
+            success is not None
+            and termination is not None
+            and success != (termination.lower() == "success")
+        ):
+            raise ValueError(
+                f"rollout {index} success and termination describe different outcomes"
+            )
         rollout_seed = rollout.get("seed")
         rollout_policy = rollout.get("policy_version", context.get("policy_version"))
         next_policy = rollout.get(
@@ -474,6 +711,23 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
         raw_universe = rollout.get("universe", extra.get("universe"))
         if raw_universe is not None and not isinstance(raw_universe, dict):
             raise ValueError(f"rollout {index} universe must be a JSON object")
+        raw_lifecycle = rollout.get("lifecycle", [])
+        if raw_lifecycle is None:
+            raw_lifecycle = []
+        if not isinstance(raw_lifecycle, list):
+            raise ValueError(f"rollout {index} lifecycle must be a list")
+        lifecycle: list[dict[str, Any]] = []
+        for event_index, event in enumerate(raw_lifecycle):
+            if not isinstance(event, dict):
+                raise ValueError(
+                    f"rollout {index} lifecycle event {event_index} must be an object"
+                )
+            state = event.get("state")
+            if state is not None and not isinstance(state, str):
+                raise ValueError(
+                    f"rollout {index} lifecycle event {event_index} state must be text"
+                )
+            lifecycle.append(dict(event))
         raw_actions = rollout.get("action_vectors", extra.get("action_vectors", []))
         if raw_actions is None:
             raw_actions = []
@@ -513,6 +767,35 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
         rollout_generation_value = _optional_integer(
             rollout_generation, f"rollout {index} generation"
         )
+        generation_world_count = _optional_integer(
+            context.get("world_count"), f"rollout {index} generation world_count"
+        )
+        if generation_world_count is not None and generation_world_count <= 0:
+            raise ValueError(f"rollout {index} generation world_count must be positive")
+        generation_average_reward = _optional_number(
+            context.get("average_reward"),
+            f"rollout {index} generation average_reward",
+        )
+        generation_best_reward = _optional_number(
+            context.get("best_reward"),
+            f"rollout {index} generation best_reward",
+        )
+        generation_success_rate = _optional_number(
+            context.get("success_rate"),
+            f"rollout {index} generation success_rate",
+        )
+        generation_collision_rate = _optional_number(
+            context.get("collision_rate"),
+            f"rollout {index} generation collision_rate",
+        )
+        for rate_name, rate in (
+            ("success_rate", generation_success_rate),
+            ("collision_rate", generation_collision_rate),
+        ):
+            if rate is not None and not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    f"rollout {index} generation {rate_name} must be between 0 and 1"
+                )
         explicit_champion = (
             sandbox_id is not None
             and sandbox_id == context.get("champion_sandbox")
@@ -536,10 +819,10 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
             provenance = "DAYTONA TRAINING"
         elif verified and envelope_kind == "raw_daytona":
             provenance = "DAYTONA ROLLOUT"
-        elif sandbox_id is not None:
-            provenance = "UNVERIFIED RECORDED REPLAY"
         else:
-            provenance = "LOCAL REPLAY"
+            # Anything loaded through --rollouts is recorded input. Local
+            # preview is reserved for the explicit --local-preview runtime.
+            provenance = "UNVERIFIED RECORDED REPLAY"
         attempts.append(
             AttemptTrail(
                 points=tuple(points),
@@ -553,12 +836,9 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
                 trajectory=tuple(normalized_trajectory),
                 action_vectors=tuple(action_vectors),
                 universe=(dict(raw_universe) if raw_universe is not None else None),
+                lifecycle=tuple(lifecycle),
                 world_index=world_index,
-                termination=(
-                    str(rollout["termination"])
-                    if rollout.get("termination") is not None
-                    else None
-                ),
+                termination=termination,
                 min_clearance=(
                     _optional_number(top_min_clearance, f"rollout {index} min_clearance")
                     if top_min_clearance is not None
@@ -574,6 +854,11 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
                     if top_max_speed is not None
                     else max(point_speeds, default=None)
                 ),
+                generation_average_reward=generation_average_reward,
+                generation_best_reward=generation_best_reward,
+                generation_success_rate=generation_success_rate,
+                generation_collision_rate=generation_collision_rate,
+                generation_world_count=generation_world_count,
                 provenance=provenance,
                 daytona_verified=verified,
                 is_champion=bool(explicit_champion),
@@ -595,6 +880,25 @@ def load_rollout_trails(path: str | Path) -> list[AttemptTrail]:
         if declared and len(explicit) != 1:
             raise ValueError("rollout artifact champion does not identify exactly one world")
         if explicit:
+            champion_reward = attempts[explicit[0]].reward
+            scored_rewards = [
+                float(attempts[index].reward)
+                for index in indices
+                if attempts[index].reward is not None
+            ]
+            if (
+                champion_reward is None
+                or not scored_rewards
+                or not math.isclose(
+                    float(champion_reward),
+                    max(scored_rewards),
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-9,
+                )
+            ):
+                raise ValueError(
+                    "rollout artifact champion is not a maximum recorded reward"
+                )
             continue
         scored = [index for index in indices if attempts[index].reward is not None]
         if scored:
@@ -611,6 +915,21 @@ def _xy(value: Any) -> tuple[float, float]:
 
 def _position(entity: dict[str, Any]) -> tuple[float, float]:
     return _xy(entity["position"])
+
+
+def _screen_point(position: tuple[float, float]) -> tuple[float, float]:
+    """Map a recorded world coordinate into the unobscured champion viewport."""
+
+    scale = min(WORLD_VIEWPORT_WIDTH / WIDTH, WORLD_VIEWPORT_HEIGHT / HEIGHT)
+    return (
+        WORLD_VIEWPORT_X + position[0] * scale,
+        WORLD_VIEWPORT_Y + position[1] * scale,
+    )
+
+
+def _screen_radius(radius: float) -> int:
+    scale = min(WORLD_VIEWPORT_WIDTH / WIDTH, WORLD_VIEWPORT_HEIGHT / HEIGHT)
+    return max(1, round(float(radius) * scale))
 
 
 def make_stars(seed: int, count: int = 190) -> list[tuple[int, int, int, int, float, float]]:
@@ -659,7 +978,11 @@ def make_background(seed: int) -> tuple[Any, list[tuple[int, int, int, int, floa
     return background, make_stars(seed)
 
 
-def draw_stars(screen: Any, stars: list[tuple[int, int, int, int, float, float]], elapsed: float) -> None:
+def draw_stars(
+    screen: Any,
+    stars: list[tuple[int, int, int, int, float, float]],
+    elapsed: float,
+) -> None:
     assert pygame is not None
     for x, y, radius, base, phase, speed in stars:
         brightness = max(80, min(255, int(base + 28 * math.sin(elapsed * speed + phase))))
@@ -678,7 +1001,7 @@ def draw_trail(screen: Any, trail: deque[tuple[float, float]]) -> None:
     if len(trail) < 2:
         return
 
-    points = list(trail)
+    points = [_screen_point(point) for point in trail]
     count = len(points)
     for index in range(1, count):
         freshness = index / count
@@ -691,56 +1014,70 @@ def draw_trail(screen: Any, trail: deque[tuple[float, float]]) -> None:
         pygame.draw.line(screen, colour, points[index - 1], points[index], width)
 
 
+def _ghost_attempts(
+    attempts: list[AttemptTrail],
+    current_seed: int,
+    active_attempt: AttemptTrail | None = None,
+) -> list[AttemptTrail]:
+    """Select earlier paths without leaking the active or another universe."""
+
+    candidates = [
+        attempt
+        for attempt in attempts
+        if attempt is not active_attempt
+        and attempt.seed == current_seed
+        and len(attempt.points) >= 2
+    ]
+    if active_attempt is None:
+        return candidates
+    if active_attempt.generation is None:
+        return []
+    return [
+        attempt
+        for attempt in candidates
+        if attempt.generation is not None
+        and attempt.generation < active_attempt.generation
+    ]
+
+
 def draw_ghost_trails(
     screen: Any,
     attempts: list[AttemptTrail],
     current_seed: int,
+    active_attempt: AttemptTrail | None = None,
 ) -> None:
-    """Render only paths recorded in this exact seeded universe."""
+    """Render earlier paths only when they belong to this exact universe.
+
+    A trajectory from another seed is never projected over the active world's
+    geometry.  The active replay is also excluded so its future path is not
+    revealed before the replay cursor reaches it.
+    """
 
     assert pygame is not None
-    eligible = [
-        attempt
-        for attempt in attempts
-        if attempt.seed == current_seed and len(attempt.points) >= 2
-    ]
+    eligible = _ghost_attempts(attempts, current_seed, active_attempt)
     if not eligible:
         return
 
     layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     for attempt in eligible:
         colour = (89, 255, 183) if attempt.is_champion else (115, 139, 185)
-        alpha = 90 if attempt.is_champion else 34
-        width = 2 if attempt.is_champion else 1
-        pygame.draw.lines(layer, (*colour, alpha), False, attempt.points, width)
+        generation_age = (
+            max(1, active_attempt.generation - attempt.generation)
+            if active_attempt is not None
+            and active_attempt.generation is not None
+            and attempt.generation is not None
+            else 1
+        )
+        alpha = max(20, (82 if attempt.is_champion else 42) - generation_age * 7)
+        width = 2 if attempt.is_champion and generation_age <= 2 else 1
+        screen_points = [_screen_point(point) for point in attempt.points]
+        pygame.draw.lines(layer, (*colour, alpha), False, screen_points, width)
 
         if attempt.is_champion:
-            endpoint = (round(attempt.points[-1][0]), round(attempt.points[-1][1]))
+            endpoint = tuple(round(value) for value in screen_points[-1])
             pygame.draw.circle(layer, (*colour, 145), endpoint, 6, 2)
 
     screen.blit(layer, (0, 0))
-
-
-def draw_champion_label(
-    screen: Any,
-    attempts: list[AttemptTrail],
-    current_seed: int,
-    label_font: Any,
-) -> None:
-    assert pygame is not None
-    eligible = [
-        attempt
-        for attempt in attempts
-        if attempt.seed == current_seed and attempt.is_champion and len(attempt.points) >= 2
-    ]
-    if not eligible:
-        return
-    champion = eligible[0]
-    endpoint = (round(champion.points[-1][0]), round(champion.points[-1][1]))
-    label = label_font.render("CURRENT CHAMPION", True, (115, 255, 195))
-    label_x = max(8, min(WIDTH - label.get_width() - 8, endpoint[0] + 10))
-    label_y = max(8, min(HEIGHT - label.get_height() - 8, endpoint[1] - 22))
-    screen.blit(label, (label_x, label_y))
 
 
 def draw_recorded_trail(screen: Any, attempt: AttemptTrail, cursor: int) -> None:
@@ -749,7 +1086,7 @@ def draw_recorded_trail(screen: Any, attempt: AttemptTrail, cursor: int) -> None
     assert pygame is not None
     end = min(len(attempt.points), max(1, cursor + 1))
     start = max(0, end - TRAIL_LENGTH)
-    points = attempt.points[start:end]
+    points = tuple(_screen_point(point) for point in attempt.points[start:end])
     if len(points) < 2:
         return
 
@@ -804,6 +1141,73 @@ def _outcome_colour(attempt: AttemptTrail) -> tuple[int, int, int]:
     if termination in {"timeout", "out_of_bounds"}:
         return (255, 190, 74)
     return MUTED
+
+
+def _short_identifier(value: str | None, limit: int = 24) -> str:
+    """Return a compact, unchanged-at-the-ends identifier for small cards."""
+
+    if value is None:
+        return "N/A"
+    if len(value) <= limit:
+        return value
+    side = max(3, (limit - 1) // 2)
+    return f"{value[:side]}…{value[-side:]}"
+
+
+def _lifecycle_states(attempt: AttemptTrail) -> tuple[str, ...]:
+    """Return the exact recorded lifecycle states in artifact order."""
+
+    return tuple(
+        str(event["state"]).upper()
+        for event in attempt.lifecycle
+        if isinstance(event.get("state"), str) and event["state"]
+    )
+
+
+def _learning_history(attempts: list[AttemptTrail]) -> list[dict[str, Any]]:
+    """Summarize real loaded generations without assuming improvement."""
+
+    grouped: dict[tuple[int, int | None], list[AttemptTrail]] = {}
+    for attempt in attempts:
+        if attempt.generation is None:
+            continue
+        grouped.setdefault((attempt.generation, attempt.policy_version), []).append(attempt)
+
+    history: list[dict[str, Any]] = []
+    for (generation, policy_version), group in sorted(grouped.items()):
+        rewards = [float(item.reward) for item in group if item.reward is not None]
+        outcomes = [bool(item.success) for item in group if item.success is not None]
+        collisions = [
+            "collision" in str(item.termination or "").lower()
+            for item in group
+            if item.termination is not None
+        ]
+        first = group[0]
+        average_reward = first.generation_average_reward
+        if average_reward is None and rewards:
+            average_reward = math.fsum(rewards) / len(rewards)
+        best_reward = first.generation_best_reward
+        if best_reward is None and rewards:
+            best_reward = max(rewards)
+        success_rate = first.generation_success_rate
+        if success_rate is None and outcomes:
+            success_rate = sum(outcomes) / len(outcomes)
+        collision_rate = first.generation_collision_rate
+        if collision_rate is None and collisions:
+            collision_rate = sum(collisions) / len(collisions)
+        history.append(
+            {
+                "generation": generation,
+                "policy_version": policy_version,
+                "average_reward": average_reward,
+                "best_reward": best_reward,
+                "success_rate": success_rate,
+                "collision_rate": collision_rate,
+                "world_count": first.generation_world_count or len(group),
+                "daytona_verified": all(item.daytona_verified for item in group),
+            }
+        )
+    return history
 
 
 def _mini_world_surface(
@@ -876,17 +1280,28 @@ def draw_parallel_universes(
     )[:8]
     panel = pygame.Rect(858, 18, 324, 704)
     translucent_panel(screen, panel)
-    heading = "PARALLEL DAYTONA UNIVERSES" if active.daytona_verified else "PARALLEL RECORDED UNIVERSES"
+    heading = (
+        "PARALLEL DAYTONA UNIVERSES"
+        if active.daytona_verified
+        else "LOCAL PREVIEW UNIVERSES"
+        if all(item.provenance == "LOCAL PREVIEW" for item in group)
+        else "PARALLEL RECORDED UNIVERSES"
+    )
     screen.blit(text_font.render(heading, True, WHITE), (872, 29))
-    policy = f"POLICY v{active.policy_version}" if active.policy_version is not None else "POLICY N/A"
-    generation = f"GEN {active.generation}" if active.generation is not None else "GEN N/A"
+    policy = f"v{active.policy_version}" if active.policy_version is not None else "vN/A"
+    generation = f"G{active.generation}" if active.generation is not None else "GN/A"
     trained_next = (
-        f"  →  TRAINED v{active.next_policy_version}"
+        f" → v{active.next_policy_version}"
         if active.daytona_verified and active.next_policy_version is not None
         else ""
     )
+    world_count = active.generation_world_count or len(group)
     screen.blit(
-        small_font.render(f"{generation}  •  {policy}{trained_next}", True, MUTED),
+        small_font.render(
+            f"{generation}  •  {policy}{trained_next}  •  {world_count} WORLDS",
+            True,
+            MUTED,
+        ),
         (872, 52),
     )
 
@@ -902,7 +1317,13 @@ def draw_parallel_universes(
             card_layer.get_rect(),
             border_radius=8,
         )
-        pygame.draw.rect(card_layer, (*border, 220), card_layer.get_rect(), 2 if selected or attempt.is_champion else 1, border_radius=8)
+        pygame.draw.rect(
+            card_layer,
+            (*border, 220),
+            card_layer.get_rect(),
+            2 if selected or attempt.is_champion else 1,
+            border_radius=8,
+        )
         screen.blit(card_layer, card.topleft)
 
         if attempt.seed is not None:
@@ -914,12 +1335,56 @@ def draw_parallel_universes(
             screen.blit(preview, (card.x + 7, card.y + 8))
 
         world_number = attempt.world_index if attempt.world_index is not None else index + 1
-        badge = "  CURRENT CHAMPION" if attempt.is_champion else "  ACTIVE" if selected else ""
+        if attempt.is_champion:
+            badge = (
+                " • CHAMPION"
+                if attempt.daytona_verified
+                else " • PREVIEW BEST"
+                if attempt.provenance == "LOCAL PREVIEW"
+                else " • RECORDED BEST"
+            )
+        else:
+            badge = " • ACTIVE" if selected else ""
         reward = f"{attempt.reward:+.2f}" if attempt.reward is not None else "N/A"
-        seed_text = str(attempt.seed) if attempt.seed is not None else "N/A"
-        screen.blit(small_font.render(f"WORLD {world_number:02d}{badge}", True, border), (card.x + 119, card.y + 8))
-        screen.blit(small_font.render(f"SEED {seed_text}  •  RWD {reward}", True, WHITE), (card.x + 119, card.y + 28))
-        screen.blit(small_font.render(_outcome_label(attempt), True, _outcome_colour(attempt)), (card.x + 119, card.y + 48))
+        outcome = _outcome_label(attempt)
+        card_outcome = (
+            "COLLISION"
+            if "COLLISION" in outcome
+            else "OUT BOUNDS"
+            if "OUT OF BOUNDS" in outcome
+            else outcome[:11]
+        )
+        states = _lifecycle_states(attempt)
+        if attempt.daytona_verified:
+            execution = (
+                "DAYTONA • FINISHED"
+                if "RESULT_COLLECTED" in states or not states
+                else "DAYTONA • RECORDED"
+            )
+        elif attempt.provenance == "LOCAL PREVIEW":
+            execution = "LOCAL PREVIEW"
+        else:
+            execution = "UNVERIFIED REPLAY"
+        screen.blit(
+            small_font.render(f"WORLD {world_number:02d}{badge}", True, border),
+            (card.x + 119, card.y + 5),
+        )
+        screen.blit(
+            small_font.render(f"RWD {reward} • {card_outcome}", True, _outcome_colour(attempt)),
+            (card.x + 119, card.y + 20),
+        )
+        screen.blit(
+            small_font.render(execution, True, GREEN if attempt.daytona_verified else MUTED),
+            (card.x + 119, card.y + 36),
+        )
+        screen.blit(
+            small_font.render(
+                f"ID {_short_identifier(attempt.sandbox_id, 20)}",
+                True,
+                WHITE if attempt.sandbox_id else MUTED,
+            ),
+            (card.x + 119, card.y + 52),
+        )
 
 
 def draw_replay_banner(
@@ -928,19 +1393,175 @@ def draw_replay_banner(
     fonts: tuple[Any, Any, Any],
 ) -> None:
     assert pygame is not None
-    title_font, text_font, _ = fonts
-    rect = pygame.Rect(520, 18, 320, 82)
+    title_font, text_font, small_font = fonts
+    rect = pygame.Rect(18, 18, 482, 82)
     translucent_panel(screen, rect)
-    if attempt.is_champion:
+    if attempt.daytona_verified and attempt.is_champion:
         headline = "CURRENT CHAMPION"
         colour = GREEN
-    else:
+    elif attempt.daytona_verified:
         world = attempt.world_index if attempt.world_index is not None else "?"
         headline = f"PARALLEL WORLD {world}"
         colour = CYAN
-    reward = f"reward {attempt.reward:+.2f}" if attempt.reward is not None else "reward N/A"
-    screen.blit(title_font.render(headline, True, colour), (536, 29))
-    screen.blit(text_font.render(f"{_outcome_label(attempt)}  •  {reward}", True, WHITE), (537, 65))
+    elif attempt.provenance == "LOCAL PREVIEW":
+        headline = "LOCAL PREVIEW"
+        colour = (255, 190, 74)
+    else:
+        headline = "UNVERIFIED REPLAY"
+        colour = (255, 190, 74)
+    reward = f"{attempt.reward:+.2f}" if attempt.reward is not None else "N/A"
+    world = attempt.world_index if attempt.world_index is not None else "?"
+    generation = attempt.generation if attempt.generation is not None else "N/A"
+    policy = f"v{attempt.policy_version}" if attempt.policy_version is not None else "N/A"
+    outcome = _outcome_label(attempt)
+    if "COLLISION" in outcome:
+        outcome = "COLLISION"
+    elif "OUT OF BOUNDS" in outcome:
+        outcome = "OUT BOUNDS"
+    screen.blit(title_font.render("GRAVITY GAUNTLET", True, WHITE), (34, 28))
+    badge = text_font.render(headline, True, colour)
+    screen.blit(badge, (rect.right - badge.get_width() - 18, 34))
+    detail = (
+        f"WORLD {world}  •  GEN {generation}  •  {policy}  •  "
+        f"{outcome}  •  RWD {reward}"
+    )
+    screen.blit(small_font.render(detail, True, WHITE), (35, 67))
+
+
+def _lifecycle_colour(state: str) -> tuple[int, int, int]:
+    if state in {"SUCCESS", "RESULT_COLLECTED"}:
+        return GREEN
+    if state in {"COLLISION", "ERROR"}:
+        return RED
+    if state in {"OUT_OF_BOUNDS", "TIMEOUT"}:
+        return (255, 190, 74)
+    if state in {"LIVE", "RUNNING"}:
+        return CYAN
+    return MUTED
+
+
+def draw_lifecycle_panel(
+    screen: Any,
+    attempt: AttemptTrail,
+    fonts: tuple[Any, Any, Any],
+) -> None:
+    """Show recorded sandbox events as evidence, never as a simulated live feed."""
+
+    assert pygame is not None
+    _, text_font, small_font = fonts
+    panel = pygame.Rect(520, 18, 320, 82)
+    translucent_panel(screen, panel)
+    title = (
+        "RECORDED DAYTONA LIFECYCLE"
+        if attempt.daytona_verified
+        else "EXECUTION PROVENANCE"
+    )
+    screen.blit(text_font.render(title, True, WHITE), (536, 29))
+    states = _lifecycle_states(attempt)
+    if not states:
+        if attempt.provenance == "LOCAL PREVIEW":
+            primary = "LOCAL PREVIEW — NO DAYTONA CLAIM"
+        else:
+            primary = "NO LIFECYCLE EVENTS IN ARTIFACT"
+        screen.blit(small_font.render(primary, True, (255, 190, 74)), (536, 65))
+        return
+
+    shown = states[:5]
+    for index, state in enumerate(shown):
+        x = 540 + index * 59
+        colour = _lifecycle_colour(state)
+        if index:
+            pygame.draw.line(screen, (55, 94, 125), (x - 21, 67), (x - 6, 67), 2)
+        pygame.draw.circle(screen, colour, (x, 67), 4)
+        detail = {
+            "CREATING": "CREATE",
+            "RUNNING": "RUN",
+            "OUT_OF_BOUNDS": "OUT",
+            "RESULT_COLLECTED": "COLLECT",
+        }.get(state, state[:7])
+        label = small_font.render(detail, True, colour)
+        screen.blit(label, label.get_rect(center=(x, 52)))
+
+
+def draw_learning_history_panel(
+    screen: Any,
+    attempts: list[AttemptTrail],
+    fonts: tuple[Any, Any, Any],
+) -> None:
+    """Plot actual generation rewards; a falling line remains a falling line."""
+
+    assert pygame is not None
+    history = _learning_history(attempts)
+    if len(history) < 2:
+        return
+    _, text_font, small_font = fonts
+    panel = pygame.Rect(520, 625, 320, 112)
+    translucent_panel(screen, panel)
+    verified = all(bool(item["daytona_verified"]) for item in history)
+    local_preview = all(
+        attempt.provenance == "LOCAL PREVIEW" for attempt in attempts
+    )
+    title = (
+        "REAL DAYTONA LEARNING HISTORY"
+        if verified
+        else "LOCAL PREVIEW HISTORY"
+        if local_preview
+        else "UNVERIFIED RECORDED HISTORY"
+    )
+    screen.blit(text_font.render(title, True, WHITE), (536, 634))
+    screen.blit(
+        small_font.render("AVG REWARD", True, CYAN),
+        (536, 658),
+    )
+    screen.blit(
+        small_font.render("BEST", True, GREEN),
+        (626, 658),
+    )
+
+    plot = pygame.Rect(536, 678, 286, 26)
+    values = [
+        float(value)
+        for item in history
+        for value in (item["average_reward"], item["best_reward"])
+        if value is not None
+    ]
+    if not values:
+        screen.blit(small_font.render("NO REWARD METRICS IN ARTIFACT", True, MUTED), plot.topleft)
+        return
+    low, high = min(values), max(values)
+    padding = max(1.0, (high - low) * 0.08)
+    low -= padding
+    high += padding
+
+    def point(index: int, value: float) -> tuple[int, int]:
+        x = plot.x + round(index * plot.width / max(1, len(history) - 1))
+        ratio = (value - low) / (high - low)
+        return x, plot.bottom - round(ratio * plot.height)
+
+    average_points = [
+        point(index, float(item["average_reward"]))
+        for index, item in enumerate(history)
+        if item["average_reward"] is not None
+    ]
+    best_points = [
+        point(index, float(item["best_reward"]))
+        for index, item in enumerate(history)
+        if item["best_reward"] is not None
+    ]
+    if len(average_points) >= 2:
+        pygame.draw.lines(screen, CYAN, False, average_points, 2)
+    if len(best_points) >= 2:
+        pygame.draw.lines(screen, GREEN, False, best_points, 2)
+    for colour, points in ((CYAN, average_points), (GREEN, best_points)):
+        for chart_point in points:
+            pygame.draw.circle(screen, colour, chart_point, 4)
+
+    label_indices = range(len(history)) if len(history) <= 8 else range(0, len(history), 2)
+    for index in label_indices:
+        item = history[index]
+        x = plot.x + round(index * plot.width / max(1, len(history) - 1))
+        label = small_font.render(f"G{item['generation']}", True, MUTED)
+        screen.blit(label, label.get_rect(center=(x, 721)))
 
 
 def draw_speed_streaks(
@@ -954,6 +1575,7 @@ def draw_speed_streaks(
     speed = math.hypot(*velocity)
     if speed < 60.0:
         return
+    position = _screen_point(position)
     direction = (velocity[0] / speed, velocity[1] / speed)
     side = (-direction[1], direction[0])
     length = min(34.0, 5.0 + speed * 0.065)
@@ -996,11 +1618,16 @@ def draw_planets(screen: Any, planets: list[dict[str, Any]], seed: int) -> None:
 
     for index, planet in enumerate(planets):
         x, y = _position(planet)
-        center = (round(x), round(y))
-        radius = max(3, round(float(planet["radius"])))
+        center = tuple(round(value) for value in _screen_point((x, y)))
+        radius = max(3, _screen_radius(float(planet["radius"])))
         fallback = PLANET_PALETTE[(seed + index * 3) % len(PLANET_PALETTE)]
         colour = tuple(planet.get("colour", planet.get("color", fallback)))
-        gravity_radius = max(radius + 2, round(float(planet.get("gravity_radius", radius * 4))))
+        gravity_radius = max(
+            radius + 2,
+            _screen_radius(
+                float(planet.get("gravity_radius", float(planet["radius"]) * 4))
+            ),
+        )
         _gravity_ring(effects, center, gravity_radius, colour)
         pygame.draw.circle(effects, (*colour, 18), center, max(radius + 18, int(radius * 1.7)))
         pygame.draw.circle(effects, (*colour, 38), center, radius + 10)
@@ -1009,8 +1636,8 @@ def draw_planets(screen: Any, planets: list[dict[str, Any]], seed: int) -> None:
 
     for index, planet in enumerate(planets):
         x, y = _position(planet)
-        center = (round(x), round(y))
-        radius = max(3, round(float(planet["radius"])))
+        center = tuple(round(value) for value in _screen_point((x, y)))
+        radius = max(3, _screen_radius(float(planet["radius"])))
         fallback = PLANET_PALETTE[(seed + index * 3) % len(PLANET_PALETTE)]
         colour = tuple(planet.get("colour", planet.get("color", fallback)))
 
@@ -1049,8 +1676,8 @@ def asteroid_points(
 def draw_asteroids(screen: Any, asteroids: list[dict[str, Any]], seed: int) -> None:
     assert pygame is not None
     for index, asteroid in enumerate(asteroids):
-        center = _position(asteroid)
-        radius = float(asteroid["radius"])
+        center = _screen_point(_position(asteroid))
+        radius = float(_screen_radius(float(asteroid["radius"])))
         points = asteroid_points(center, radius, seed, index)
         shadow = [(x + 3, y + 4) for x, y in points]
         base = tuple(asteroid.get("colour", asteroid.get("color", (91, 98, 114))))
@@ -1072,8 +1699,8 @@ def draw_asteroids(screen: Any, asteroids: list[dict[str, Any]], seed: int) -> N
 def draw_portal(screen: Any, portal: dict[str, Any], elapsed: float) -> None:
     assert pygame is not None
     x, y = _position(portal)
-    center = (round(x), round(y))
-    radius = max(5, round(float(portal["radius"])))
+    center = tuple(round(value) for value in _screen_point((x, y)))
+    radius = max(5, _screen_radius(float(portal["radius"])))
     pulse = 1.0 + 0.08 * math.sin(elapsed * 4.2)
     colour = tuple(portal.get("colour", portal.get("color", (80, 245, 255))))
 
@@ -1109,8 +1736,8 @@ def draw_ship(
     ship_radius: float,
 ) -> None:
     assert pygame is not None
-    x, y = position
-    radius = max(9.0, ship_radius * 1.35)
+    x, y = _screen_point(position)
+    radius = max(7.0, _screen_radius(ship_radius) * 1.35)
     forward = (math.cos(angle), math.sin(angle))
     side = (-forward[1], forward[0])
 
@@ -1211,8 +1838,11 @@ def draw_hud(
     policy_version: int | None,
     source_label: str,
 ) -> None:
+    """Draw an unmistakably local-only HUD without obscuring the flight viewport."""
+
     assert pygame is not None
-    title_font, text_font = fonts[:2]
+    title_font, text_font, small_font = fonts
+    del generation, policy_version
     vx, vy = _xy(env.ship_velocity)
     speed = math.hypot(vx, vy)
     status, status_colour = status_text(env)
@@ -1220,7 +1850,9 @@ def draw_hud(
         float(attempt.reward) for attempt in attempts if attempt.reward is not None
     ]
     average_reward = (
-        f"{sum(completed_rewards) / len(completed_rewards):8.2f}" if completed_rewards else "     N/A"
+        f"{sum(completed_rewards) / len(completed_rewards):8.2f}"
+        if completed_rewards
+        else "     N/A"
     )
     best_reward = f"{max(completed_rewards):8.2f}" if completed_rewards else "     N/A"
     known_outcomes = [attempt.success for attempt in attempts if attempt.success is not None]
@@ -1231,28 +1863,65 @@ def draw_hud(
     )
     info = env.info()
     clearance_seen = float(info["min_clearance_seen"])
-    generation_text = str(generation) if generation is not None else "N/A"
-    policy_text = f"v{policy_version}" if policy_version is not None else "MANUAL"
-
-    panel = pygame.Rect(18, 18, 445, 286)
-    translucent_panel(screen, panel)
+    banner = pygame.Rect(18, 18, 482, 82)
+    translucent_panel(screen, banner)
     screen.blit(title_font.render("GRAVITY GAUNTLET", True, WHITE), (34, 29))
-
-    lines = (
-        (f"SOURCE       {source_label}", MUTED),
-        (f"SEED / STEP  {seed} / {env.timestep}", WHITE),
-        (f"GEN / POLICY {generation_text} / {policy_text}", WHITE),
-        (f"CURRENT RWD  {env.episode_reward:8.2f}", WHITE),
-        (f"ALL AVG/BEST {average_reward} / {best_reward}", WHITE),
-        (f"ALL SUCCESS  {success_rate}  ({len(known_outcomes)} outcomes)", WHITE),
-        (f"VELOCITY     ({vx:6.1f}, {vy:6.1f})", WHITE),
-        (f"SPEED        {speed:8.2f}", WHITE),
-        (f"TARGET       {distance_to_portal(env):8.1f} px", WHITE),
-        (f"MIN CLEAR    {clearance_seen:8.2f} px", WHITE if clearance_seen >= 58 else RED),
-        (f"STATUS       {status}", status_colour),
+    preview_badge = text_font.render("LOCAL PREVIEW", True, (255, 190, 74))
+    screen.blit(preview_badge, (banner.right - preview_badge.get_width() - 18, 35))
+    screen.blit(
+        small_font.render(
+            f"SEED {seed}  •  MANUAL CONTROL  •  {status}",
+            True,
+            status_colour,
+        ),
+        (35, 67),
     )
-    for index, (text, colour) in enumerate(lines):
-        screen.blit(text_font.render(text, True, colour), (35, 61 + index * 20))
+
+    provenance = pygame.Rect(520, 18, 320, 82)
+    translucent_panel(screen, provenance)
+    screen.blit(text_font.render("EXECUTION PROVENANCE", True, WHITE), (536, 29))
+    screen.blit(
+        small_font.render("LOCAL PREVIEW — NO DAYTONA CLAIM", True, (255, 190, 74)),
+        (536, 54),
+    )
+    screen.blit(
+        small_font.render("KEYBOARD PHYSICS ONLY • NO SANDBOX", True, MUTED),
+        (536, 72),
+    )
+
+    panel = pygame.Rect(18, 625, 822, 112)
+    translucent_panel(screen, panel)
+    screen.blit(
+        text_font.render("LOCAL PHYSICS PREVIEW  •  MANUAL CONTROL", True, WHITE),
+        (34, 636),
+    )
+    rows = (
+        (
+            (34, f"CURRENT RWD {env.episode_reward:+.2f}", WHITE),
+            (210, f"RUN AVG {average_reward.strip()}", CYAN),
+            (366, f"RUN BEST {best_reward.strip()}", GREEN),
+            (531, f"SUCCESS {success_rate.strip()} / {len(known_outcomes)}", WHITE),
+        ),
+        (
+            (34, f"VELOCITY ({vx:+.1f}, {vy:+.1f})", WHITE),
+            (236, f"SPEED {speed:.2f}", WHITE),
+            (370, f"TARGET {distance_to_portal(env):.1f}px", WHITE),
+            (
+                531,
+                f"MIN CLEAR {clearance_seen:.2f}px",
+                WHITE if clearance_seen >= 58 else RED,
+            ),
+        ),
+        (
+            (34, f"SEED {seed}", WHITE),
+            (210, f"STEP {env.timestep}", WHITE),
+            (366, f"STATUS {status}", status_colour),
+            (600, f"SOURCE {source_label}", MUTED),
+        ),
+    )
+    for row_y, row in zip((661, 683, 705), rows):
+        for x, text, colour in row:
+            screen.blit(small_font.render(text, True, colour), (x, row_y))
 
     controls = pygame.Rect(18, HEIGHT - 61, 510, 43)
     translucent_panel(screen, controls)
@@ -1315,10 +1984,15 @@ def draw_replay_hud(
     """Show only metrics carried by, or derived from, the selected recording."""
 
     assert pygame is not None
-    title_font, text_font, small_font = fonts
+    _, text_font, small_font = fonts
     group = _attempt_group(attempts, attempt)
     scored = [float(item.reward) for item in group if item.reward is not None]
     outcomes = [item.success for item in group if item.success is not None]
+    collisions = [
+        "collision" in str(item.termination or "").lower()
+        for item in group
+        if item.termination is not None
+    ]
     velocity = _recorded_velocity(attempt, cursor)
     speed = math.hypot(*velocity) if velocity is not None else None
     clearance = _recorded_clearance(attempt, cursor)
@@ -1326,55 +2000,106 @@ def draw_replay_hud(
     finished = cursor >= len(attempt.points) - 1
     status = _outcome_label(attempt) if finished else "RECORDED FLIGHT IN PROGRESS"
     status_colour = _outcome_colour(attempt) if finished else CYAN
-    source_colour = GREEN if attempt.daytona_verified else (255, 190, 74)
-    artifact = Path(attempt.source_file).name if attempt.source_file else "N/A"
     sandbox_id = attempt.sandbox_id or "N/A"
-    if len(sandbox_id) > 31:
-        sandbox_id = f"{sandbox_id[:14]}…{sandbox_id[-14:]}"
+    if len(sandbox_id) > 44:
+        sandbox_id = f"{sandbox_id[:20]}…{sandbox_id[-20:]}"
     reward_text = f"{attempt.reward:+.2f}" if attempt.reward is not None else "N/A"
     current_reward_text = f"{reward_so_far:+.2f}" if reward_so_far is not None else "N/A"
-    average_reward = f"{sum(scored) / len(scored):+.2f}" if scored else "N/A"
-    best_reward = f"{max(scored):+.2f}" if scored else "N/A"
-    success_rate = (
-        f"{100.0 * sum(bool(value) for value in outcomes) / len(outcomes):.1f}%"
-        if outcomes
-        else "N/A"
+    average_value = (
+        attempt.generation_average_reward
+        if attempt.generation_average_reward is not None
+        else math.fsum(scored) / len(scored)
+        if scored
+        else None
     )
+    best_value = (
+        attempt.generation_best_reward
+        if attempt.generation_best_reward is not None
+        else max(scored)
+        if scored
+        else None
+    )
+    success_value = (
+        attempt.generation_success_rate
+        if attempt.generation_success_rate is not None
+        else sum(bool(value) for value in outcomes) / len(outcomes)
+        if outcomes
+        else None
+    )
+    collision_value = (
+        attempt.generation_collision_rate
+        if attempt.generation_collision_rate is not None
+        else sum(collisions) / len(collisions)
+        if collisions
+        else None
+    )
+    average_reward = f"{average_value:+.2f}" if average_value is not None else "N/A"
+    best_reward = f"{best_value:+.2f}" if best_value is not None else "N/A"
+    success_rate = f"{100.0 * success_value:.1f}%" if success_value is not None else "N/A"
+    collision_rate = f"{100.0 * collision_value:.1f}%" if collision_value is not None else "N/A"
+    generation_worlds = attempt.generation_world_count or len(group)
     speed_text = f"{speed:.2f}" if speed is not None else "N/A"
-    mean_speed_text = f"{attempt.mean_speed:.2f}" if attempt.mean_speed is not None else "N/A"
     clearance_text = f"{clearance:.2f}" if clearance is not None else "N/A"
-    min_clearance_text = f"{attempt.min_clearance:.2f}" if attempt.min_clearance is not None else "N/A"
-    world_number = attempt.world_index if attempt.world_index is not None else group.index(attempt) + 1
+    min_clearance_text = (
+        f"{attempt.min_clearance:.2f}" if attempt.min_clearance is not None else "N/A"
+    )
+    world_number = (
+        attempt.world_index
+        if attempt.world_index is not None
+        else group.index(attempt) + 1
+    )
     generation_text = str(attempt.generation) if attempt.generation is not None else "N/A"
     policy_text = f"v{attempt.policy_version}" if attempt.policy_version is not None else "N/A"
-    sample_step = cursor
-    if attempt.trajectory and attempt.trajectory[min(cursor, len(attempt.trajectory) - 1)].get("step") is not None:
-        sample_step = int(attempt.trajectory[min(cursor, len(attempt.trajectory) - 1)]["step"])
-
-    panel = pygame.Rect(18, 18, 482, 347)
+    panel = pygame.Rect(18, 625, 482, 112)
     translucent_panel(screen, panel)
-    screen.blit(title_font.render("GRAVITY GAUNTLET // REPLAY", True, WHITE), (34, 29))
-    lines = (
-        (f"SOURCE       {attempt.provenance}", source_colour),
-        (f"ARTIFACT     {artifact}", MUTED),
-        (f"SANDBOX      {sandbox_id}", WHITE if attempt.sandbox_id else MUTED),
-        (f"WORLD / SEED {world_number}/{len(group)} / {attempt.seed if attempt.seed is not None else 'N/A'}", WHITE),
-        (f"GEN / POLICY {generation_text} / {policy_text}", WHITE),
-        (f"TOTAL REWARD {reward_text}   LIVE {current_reward_text}", WHITE),
-        (f"GEN AVG/BEST {average_reward} / {best_reward}", WHITE),
-        (f"GEN SUCCESS  {success_rate}  ({len(outcomes)} outcomes)", WHITE),
-        (f"SPEED        {speed_text}   MEAN {mean_speed_text}", WHITE),
-        (f"CLEARANCE    {clearance_text}   MIN {min_clearance_text}", WHITE),
-        (
-            f"NEXT / THRUST  {f'v{attempt.next_policy_version}' if attempt.next_policy_version is not None else 'N/A'} / "
-            f"{'RECORDED' if attempt.action_vectors else 'NOT PRESENT'}",
-            WHITE if attempt.next_policy_version is not None or attempt.action_vectors else MUTED,
-        ),
-        (f"PLAYBACK     STEP {sample_step}  POINT {cursor + 1}/{len(attempt.points)}", WHITE),
-        (f"STATUS       {status}", status_colour),
+    backend = (
+        "DAYTONA"
+        if attempt.daytona_verified
+        else "LOCAL PREVIEW"
+        if attempt.provenance == "LOCAL PREVIEW"
+        else "RECORDED"
     )
-    for index, (text, colour) in enumerate(lines):
-        screen.blit(text_font.render(text, True, colour), (35, 61 + index * 21))
+    heading = (
+        f"GEN {generation_text}  •  POLICY {policy_text}  •  "
+        f"{generation_worlds} {backend} WORLDS"
+    )
+    screen.blit(text_font.render(heading, True, WHITE), (34, 636))
+    if attempt.daytona_verified and attempt.next_policy_version is not None:
+        trained = small_font.render(
+            f"TRAINED v{attempt.next_policy_version}", True, GREEN
+        )
+        screen.blit(trained, (panel.right - trained.get_width() - 18, 640))
+
+    row_one = (
+        (34, f"AVG {average_reward}", CYAN),
+        (164, f"BEST {best_reward}", GREEN),
+        (298, f"SUCCESS/COLL {success_rate}/{collision_rate}", WHITE),
+    )
+    row_two = (
+        (34, f"RWD {current_reward_text}/{reward_text}", WHITE),
+        (190, f"SPEED {speed_text}", WHITE),
+        (310, f"CLEAR {clearance_text}/{min_clearance_text}", WHITE),
+    )
+    for x, text, colour in row_one:
+        screen.blit(small_font.render(text, True, colour), (x, 661))
+    for x, text, colour in row_two:
+        screen.blit(small_font.render(text, True, colour), (x, 681))
+
+    identity = (
+        f"WORLD {world_number}/{len(group)}  •  SEED "
+        f"{attempt.seed if attempt.seed is not None else 'N/A'}  •  "
+        f"POINT {cursor + 1}/{len(attempt.points)}  •  {status}"
+    )
+    screen.blit(small_font.render(identity, True, status_colour), (34, 701))
+    sandbox_label = f"SANDBOX {sandbox_id}"
+    screen.blit(
+        small_font.render(
+            sandbox_label,
+            True,
+            WHITE if attempt.sandbox_id else MUTED,
+        ),
+        (34, 719),
+    )
 
     controls = pygame.Rect(18, HEIGHT - 61, 610, 43)
     translucent_panel(screen, controls)
@@ -1388,7 +2113,7 @@ def draw_end_overlay(screen: Any, env: GravityEnv, fonts: tuple[Any, ...], elaps
         return
 
     title_font, text_font = fonts[:2]
-    center = tuple(round(value) for value in env.ship_position)
+    center = tuple(round(value) for value in _screen_point(_xy(env.ship_position)))
     effects = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
     if env.success:
@@ -1405,8 +2130,14 @@ def draw_end_overlay(screen: Any, env: GravityEnv, fonts: tuple[Any, ...], elaps
         pygame.draw.circle(effects, (255, 57, 82, 110), center, pulse, 4)
         for index in range(12):
             angle = index * math.tau / 12
-            inner = (center[0] + round(math.cos(angle) * 18), center[1] + round(math.sin(angle) * 18))
-            outer = (center[0] + round(math.cos(angle) * 52), center[1] + round(math.sin(angle) * 52))
+            inner = (
+                center[0] + round(math.cos(angle) * 18),
+                center[1] + round(math.sin(angle) * 18),
+            )
+            outer = (
+                center[0] + round(math.cos(angle) * 52),
+                center[1] + round(math.sin(angle) * 52),
+            )
             pygame.draw.line(effects, (255, 108, 82, 140), inner, outer, 3)
         headline = "SHIP LOST"
         if "collision" in str(env.status):
@@ -1420,13 +2151,20 @@ def draw_end_overlay(screen: Any, env: GravityEnv, fonts: tuple[Any, ...], elaps
         detail = f"{reason} — press R to retry or N for a new universe"
         colour = RED
 
-    screen.blit(effects, (0, 0))
-    banner = pygame.Rect(WIDTH // 2 - 285, HEIGHT // 2 - 62, 570, 124)
+    viewport = pygame.Rect(
+        WORLD_VIEWPORT_X,
+        WORLD_VIEWPORT_Y,
+        WORLD_VIEWPORT_WIDTH,
+        WORLD_VIEWPORT_HEIGHT,
+    )
+    screen.blit(effects, viewport.topleft, viewport)
+    viewport_center_x = 430
+    banner = pygame.Rect(viewport_center_x - 285, HEIGHT // 2 - 62, 570, 124)
     translucent_panel(screen, banner)
     title = title_font.render(headline, True, colour)
     subtitle = text_font.render(detail, True, WHITE)
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 19)))
-    screen.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 24)))
+    screen.blit(title, title.get_rect(center=(viewport_center_x, HEIGHT // 2 - 19)))
+    screen.blit(subtitle, subtitle.get_rect(center=(viewport_center_x, HEIGHT // 2 + 24)))
 
 
 def draw_recorded_end_overlay(
@@ -1445,11 +2183,18 @@ def draw_recorded_end_overlay(
     if not finished:
         return
     title_font, text_font, _ = fonts
+    screen_position = _screen_point(position)
     impact = (
-        max(10, min(WIDTH - 10, round(position[0]))),
-        max(10, min(HEIGHT - 10, round(position[1]))),
+        max(
+            WORLD_VIEWPORT_X + 10,
+            min(WORLD_VIEWPORT_X + WORLD_VIEWPORT_WIDTH - 10, round(screen_position[0])),
+        ),
+        max(
+            WORLD_VIEWPORT_Y + 10,
+            min(WORLD_VIEWPORT_Y + WORLD_VIEWPORT_HEIGHT - 10, round(screen_position[1])),
+        ),
     )
-    portal = (round(portal_position[0]), round(portal_position[1]))
+    portal = tuple(round(value) for value in _screen_point(portal_position))
     effects = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
     termination = (attempt.termination or "recorded_end").lower()
 
@@ -1501,13 +2246,21 @@ def draw_recorded_end_overlay(
         detail = "Recorded run ended without portal entry  •  R replay  •  N next universe"
         colour = (255, 190, 74)
 
-    screen.blit(effects, (0, 0))
-    banner = pygame.Rect(WIDTH // 2 - 315, HEIGHT // 2 - 65, 630, 130)
+    viewport = pygame.Rect(
+        WORLD_VIEWPORT_X,
+        WORLD_VIEWPORT_Y,
+        WORLD_VIEWPORT_WIDTH,
+        WORLD_VIEWPORT_HEIGHT,
+    )
+    screen.blit(effects, viewport.topleft, viewport)
+    viewport_center_x = 430
+    banner_center_y = 540
+    banner = pygame.Rect(viewport_center_x - 315, banner_center_y - 65, 630, 130)
     translucent_panel(screen, banner)
     title = title_font.render(headline, True, colour)
     subtitle = text_font.render(detail, True, WHITE)
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 20)))
-    screen.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 26)))
+    screen.blit(title, title.get_rect(center=(viewport_center_x, banner_center_y - 20)))
+    screen.blit(subtitle, subtitle.get_rect(center=(viewport_center_x, banner_center_y + 26)))
 
 
 def reset_world(env: GravityEnv, seed: int) -> None:
@@ -1530,13 +2283,13 @@ def _completed_attempt(
         min_clearance=float(env.min_clearance_seen),
         mean_speed=float(env.info()["mean_speed"]),
         max_speed=float(env.max_speed),
-        provenance="LOCAL MANUAL",
+        provenance="LOCAL PREVIEW",
     )
 
 
 def _source_label(attempts: list[AttemptTrail], current_seed: int) -> str:
     del attempts, current_seed
-    return "LOCAL MANUAL"
+    return "LOCAL PREVIEW"
 
 
 def _select_replay_group(
@@ -1620,17 +2373,29 @@ def _replay_environment(attempt: AttemptTrail) -> GravityEnv:
         raise ValueError("recorded replay is missing its universe seed")
     env = GravityEnv(seed=int(attempt.seed))
     if attempt.universe is None:
-        if attempt.daytona_verified:
-            raise ValueError(
-                f"verified Daytona replay for seed {attempt.seed} has no recorded universe"
-            )
-        return env
+        raise ValueError(
+            f"recorded replay for seed {attempt.seed} has no recorded universe"
+        )
     if env.universe_dict() != attempt.universe:
         raise ValueError(
             f"recorded universe for seed {attempt.seed} does not match the current "
             "GravityEnv; rebuild and verify the Daytona snapshot before replay"
         )
     return env
+
+
+def _validated_replay_environments(
+    attempts: list[AttemptTrail],
+) -> dict[int, GravityEnv]:
+    """Verify every loaded universe, including candidates for ghost rendering."""
+
+    environments: dict[int, GravityEnv] = {}
+    for attempt in attempts:
+        if attempt.seed is None:
+            continue
+        seed = int(attempt.seed)
+        environments[seed] = _replay_environment(attempt)
+    return environments
 
 
 def run_demo(
@@ -1644,19 +2409,33 @@ def run_demo(
     """Run the game; ``max_frames`` supports a bounded headless smoke test."""
 
     if pygame is None:
-        raise SystemExit("Pygame is required. Install the project dependencies, then run python visual_demo.py")
+        raise SystemExit(
+            "Pygame is required. Install the project dependencies, then run "
+            "python visual_demo.py"
+        )
 
     pygame.init()
     try:
         screen = pygame.display.set_mode((WIDTH, HEIGHT))
         attempts = list(rollout_trails or [])
-        replay_mode = bool(attempts)
+        replay_attempts = (
+            _select_replay_group(
+                attempts,
+                generation=generation,
+                policy_version=policy_version,
+            )
+            if attempts
+            else []
+        )
+        replay_mode = bool(replay_attempts)
         pygame.display.set_caption(
             "Gravity Gauntlet — Recorded Daytona Experience"
-            if replay_mode and all(item.daytona_verified for item in attempts)
-            else "Gravity Gauntlet — Recorded Replay"
+            if replay_mode and all(item.daytona_verified for item in replay_attempts)
+            else "Gravity Gauntlet — LOCAL PREVIEW"
+            if replay_mode and all(item.provenance == "LOCAL PREVIEW" for item in replay_attempts)
+            else "Gravity Gauntlet — Unverified Recorded Replay"
             if replay_mode
-            else "Gravity Gauntlet — 2D Space MVP"
+            else "Gravity Gauntlet — LOCAL PREVIEW"
         )
         clock = pygame.time.Clock()
         fonts = (
@@ -1665,12 +2444,13 @@ def run_demo(
             pygame.font.SysFont("menlo", 12, bold=True),
         )
 
-        replay_index = _initial_replay_index(attempts, seed) if replay_mode else 0
-        active_attempt = attempts[replay_index] if replay_mode else None
+        replay_index = _initial_replay_index(replay_attempts, seed) if replay_mode else 0
+        active_attempt = replay_attempts[replay_index] if replay_mode else None
         current_seed = int(active_attempt.seed) if active_attempt is not None else int(seed or 7)
+        validated_envs = _validated_replay_environments(attempts)
         preview_envs = {
-            int(attempt.seed): _replay_environment(attempt)
-            for attempt in attempts
+            int(attempt.seed): validated_envs[int(attempt.seed)]
+            for attempt in replay_attempts
             if attempt.seed is not None
         }
         env = preview_envs[current_seed] if replay_mode else GravityEnv(seed=current_seed)
@@ -1705,8 +2485,8 @@ def run_demo(
                             trail = deque([_xy(env.ship_position)], maxlen=TRAIL_LENGTH)
                     elif event.key == pygame.K_n:
                         if replay_mode:
-                            replay_index = (replay_index + 1) % len(attempts)
-                            active_attempt = attempts[replay_index]
+                            replay_index = (replay_index + 1) % len(replay_attempts)
+                            active_attempt = replay_attempts[replay_index]
                             current_seed = int(active_attempt.seed)
                             env = preview_envs[current_seed]
                             background, stars = make_background(current_seed)
@@ -1748,7 +2528,12 @@ def run_demo(
             elapsed = pygame.time.get_ticks() / 1000.0
             screen.blit(background, (0, 0))
             draw_stars(screen, stars, elapsed)
-            draw_ghost_trails(screen, attempts, current_seed)
+            draw_ghost_trails(
+                screen,
+                attempts,
+                current_seed,
+                active_attempt if replay_mode else None,
+            )
             if replay_mode:
                 assert active_attempt is not None
                 draw_recorded_trail(screen, active_attempt, cursor)
@@ -1759,19 +2544,20 @@ def run_demo(
             draw_portal(screen, env.portal, elapsed)
             draw_speed_streaks(screen, position, velocity)
             draw_ship(screen, position, ship_angle, thrust, float(env.ship_radius))
-            draw_champion_label(screen, attempts, current_seed, fonts[1])
             if replay_mode:
                 assert active_attempt is not None
                 finished = cursor >= len(active_attempt.points) - 1
-                draw_replay_hud(screen, active_attempt, attempts, cursor, fonts)
+                draw_replay_hud(screen, active_attempt, replay_attempts, cursor, fonts)
                 draw_parallel_universes(
                     screen,
-                    attempts,
+                    replay_attempts,
                     active_attempt,
                     preview_envs,
                     fonts,
                 )
                 draw_replay_banner(screen, active_attempt, fonts)
+                draw_lifecycle_panel(screen, active_attempt, fonts)
+                draw_learning_history_panel(screen, attempts, fonts)
                 draw_recorded_end_overlay(
                     screen,
                     active_attempt,
@@ -1801,17 +2587,22 @@ def run_demo(
                 if cursor < len(active_attempt.points) - 1:
                     replay_cursor = min(
                         len(active_attempt.points) - 1,
-                        replay_cursor + REPLAY_POINTS_PER_SECOND / FPS,
+                        replay_cursor
+                        + max(
+                            0.05,
+                            (len(active_attempt.points) - 1)
+                            / (REPLAY_TARGET_SECONDS * FPS),
+                        ),
                     )
                     replay_end_frames = 0
                 else:
                     replay_end_frames += 1
                     if (
-                        len(attempts) > 1
+                        len(replay_attempts) > 1
                         and replay_end_frames >= round(REPLAY_END_HOLD_SECONDS * FPS)
                     ):
-                        replay_index = (replay_index + 1) % len(attempts)
-                        active_attempt = attempts[replay_index]
+                        replay_index = (replay_index + 1) % len(replay_attempts)
+                        active_attempt = replay_attempts[replay_index]
                         current_seed = int(active_attempt.seed)
                         env = preview_envs[current_seed]
                         background, stars = make_background(current_seed)
@@ -1826,30 +2617,40 @@ def run_demo(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Play the deterministic Gravity Gauntlet visual MVP.")
+    parser = argparse.ArgumentParser(
+        description="Replay real Gravity Gauntlet generation JSON or run an explicit local preview."
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--rollouts",
+        type=Path,
+        help="worker/controller generation JSON to replay over seed-matched universes",
+    )
+    source.add_argument(
+        "--local-preview",
+        action="store_true",
+        help="run the keyboard-driven local development mode; never labelled Daytona",
+    )
     parser.add_argument(
         "--seed",
         type=int,
         help="universe seed (default: loaded champion's seed, otherwise 7)",
     )
-    parser.add_argument(
-        "--rollouts",
-        type=Path,
-        help="optional worker/controller JSON to replay over seed-matched universes",
-    )
     parser.add_argument("--generation", type=int, help="real generation number to display")
     parser.add_argument("--policy-version", type=int, help="real policy version to display")
     args = parser.parse_args()
+    if args.local_preview and (args.generation is not None or args.policy_version is not None):
+        parser.error("--generation and --policy-version require --rollouts, not --local-preview")
     try:
         rollout_trails = load_rollout_trails(args.rollouts) if args.rollouts else []
         if rollout_trails:
-            rollout_trails = _select_replay_group(
+            selected_group = _select_replay_group(
                 rollout_trails,
                 generation=args.generation,
                 policy_version=args.policy_version,
             )
-            replay_index = _initial_replay_index(rollout_trails, args.seed)
-            selected = rollout_trails[replay_index]
+            replay_index = _initial_replay_index(selected_group, args.seed)
+            selected = selected_group[replay_index]
             seed = int(selected.seed)
             generation = selected.generation
             policy_version = selected.policy_version
