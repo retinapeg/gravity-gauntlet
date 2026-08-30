@@ -105,6 +105,7 @@ def run_rollout(
         # daytona_worker_entry.py may inject a verified Daytona sandbox ID.
         "sandbox_id": None,
         "seed": seed,
+        "curriculum_level": env.curriculum_level,
         "policy_version": policy_version,
         "reward": float(math.fsum(rewards)),
         "success": env.success,
@@ -141,7 +142,11 @@ def execute_job(job: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("rollout contains a non-finite floating-point value")
         return value
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}

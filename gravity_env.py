@@ -11,6 +11,7 @@ from typing import Any, Sequence
 MAX_PLANETS = 5
 MAX_ASTEROIDS = 3
 ACTION_HOLD_STEPS = 4
+CURRICULUM_LEVELS = 4
 _DIAGONAL = 1.0 / math.sqrt(2.0)
 ACTION_VECTORS: tuple[tuple[float, float], ...] = (
     (0.0, 0.0),
@@ -26,6 +27,17 @@ ACTION_VECTORS: tuple[tuple[float, float], ...] = (
 
 # 7 navigation values + five 5-value planet slots + three 4-value obstacles.
 OBSERVATION_DIM = 7 + MAX_PLANETS * 5 + MAX_ASTEROIDS * 4
+
+
+def curriculum_level_for_seed(seed: int) -> int:
+    """Return the deterministic difficulty band encoded by a universe seed.
+
+    Difficulty is part of the seed-defined universe rather than mutable episode
+    state.  That keeps ``GravityEnv(seed)`` sufficient to reconstruct a recorded
+    rollout while allowing the trainer to select easier seed bands first.
+    """
+
+    return int(seed) % CURRICULUM_LEVELS
 
 
 def action_to_vector(action: int) -> tuple[float, float]:
@@ -57,7 +69,9 @@ class GravityEnv:
 
     SAFE_MARGIN = 58.0
     STEP_COST = -0.002
-    PROGRESS_SCALE = 0.022
+    # Progress is measured as a fraction of the map diagonal.  This value is
+    # calibrated to the earlier 0.022 reward per pixel on a 1200x800 map.
+    PROGRESS_SCALE = 0.022 * math.hypot(WIDTH, HEIGHT)
     THRUST_COST = 0.0015
     SAFETY_SCALE = 0.035
     PORTAL_BONUS = 300.0
@@ -69,6 +83,31 @@ class GravityEnv:
     RADIUS_SCALE = 80.0
     ACTION_HOLD_STEPS = ACTION_HOLD_STEPS
     OBSERVATION_DIM = OBSERVATION_DIM
+    CURRICULUM_LEVELS = CURRICULUM_LEVELS
+
+    # Seed band 0 is deliberately approachable for early policy updates;
+    # successive bands add bodies and shrink the portal without scripting any
+    # flight path.  Layouts, masses, and all dynamics remain seeded.
+    PLANET_COUNT_RANGES = ((1, 2), (2, 3), (2, 4), (3, 5))
+    ASTEROID_COUNT_RANGES = ((0, 0), (0, 1), (0, 2), (1, 3))
+    PORTAL_RADIUS_RANGES = (
+        (52.0, 60.0),
+        (44.0, 52.0),
+        (36.0, 44.0),
+        (28.0, 36.0),
+    )
+    HERO_MASS_RANGES = (
+        (1.30, 1.80),
+        (1.50, 2.05),
+        (1.65, 2.30),
+        (1.75, 2.55),
+    )
+    HERO_OFFSET_RANGES = (
+        (135.0, 185.0),
+        (125.0, 178.0),
+        (115.0, 172.0),
+        (105.0, 168.0),
+    )
 
     PLANET_COLOURS = (
         (255, 105, 120),
@@ -159,6 +198,7 @@ class GravityEnv:
         if seed is not None:
             self.seed = int(seed)
 
+        self.curriculum_level = curriculum_level_for_seed(self.seed)
         self._generate_universe(random.Random(self.seed))
         self.initial_ship_position = list(self.ship_position)
         self.initial_ship_velocity = list(self.ship_velocity)
@@ -395,6 +435,7 @@ class GravityEnv:
         return {
             "world_size": [self.width, self.height],
             "seed": self.seed,
+            "curriculum_level": self.curriculum_level,
             "initial_ship_position": list(self.initial_ship_position),
             "initial_ship_velocity": list(self.initial_ship_velocity),
             "ship_radius": self.ship_radius,
@@ -415,7 +456,7 @@ class GravityEnv:
                 rng.uniform(self.width - 145.0, self.width - 75.0),
                 rng.uniform(110.0, self.height - 110.0),
             ],
-            "radius": rng.uniform(28.0, 34.0),
+            "radius": rng.uniform(*self.PORTAL_RADIUS_RANGES[self.curriculum_level]),
             "colour": [80, 245, 255],
         }
 
@@ -436,7 +477,7 @@ class GravityEnv:
         corridor_length = max(1.0, math.hypot(corridor_x, corridor_y))
         along = rng.uniform(0.40, 0.64)
         side = rng.choice((-1.0, 1.0))
-        offset = rng.uniform(105.0, 168.0) * side
+        offset = rng.uniform(*self.HERO_OFFSET_RANGES[self.curriculum_level]) * side
         hero_position = [
             start_x + corridor_x * along - corridor_y / corridor_length * offset,
             start_y + corridor_y * along + corridor_x / corridor_length * offset,
@@ -455,7 +496,10 @@ class GravityEnv:
                 occupied,
                 60.0,
             )
-        hero_mass = rng.uniform(1.75, 2.55) * (hero_radius / 56.0) ** 2
+        hero_mass = (
+            rng.uniform(*self.HERO_MASS_RANGES[self.curriculum_level])
+            * (hero_radius / 56.0) ** 2
+        )
         self.planets = [
             {
                 "position": hero_position,
@@ -470,7 +514,7 @@ class GravityEnv:
         ]
         occupied.append((hero_position, hero_radius))
 
-        planet_count = rng.randint(2, MAX_PLANETS)
+        planet_count = rng.randint(*self.PLANET_COUNT_RANGES[self.curriculum_level])
         for index in range(1, planet_count):
             radius = rng.uniform(32.0, 58.0)
             position = self._sample_clear_position(
@@ -508,7 +552,8 @@ class GravityEnv:
             self.planets[0]["gm"] = self.BASE_GRAVITY_PARAMETER * minimum_hero_mass
 
         self.asteroids = []
-        for index in range(rng.randint(0, MAX_ASTEROIDS)):
+        asteroid_count = rng.randint(*self.ASTEROID_COUNT_RANGES[self.curriculum_level])
+        for index in range(asteroid_count):
             radius = rng.uniform(12.0, 22.0)
             position = self._sample_clear_position(
                 rng,
@@ -716,8 +761,11 @@ class GravityEnv:
     ) -> float:
         """Reward portal progress while teaching safety before impact."""
 
-        progress = previous_distance - self.distance_to_target()
-        reward = self.STEP_COST + progress * self.PROGRESS_SCALE
+        map_diagonal = math.hypot(self.width, self.height)
+        normalized_progress = (
+            previous_distance - self.distance_to_target()
+        ) / map_diagonal
+        reward = self.STEP_COST + normalized_progress * self.PROGRESS_SCALE
         reward -= math.hypot(*action) * self.THRUST_COST
 
         clearance = self.minimum_clearance()
@@ -752,6 +800,7 @@ class GravityEnv:
         return {
             "world_size": [self.width, self.height],
             "seed": self.seed,
+            "curriculum_level": self.curriculum_level,
             "ship_position": list(self.ship_position),
             "ship_velocity": list(self.ship_velocity),
             "ship_radius": self.ship_radius,
@@ -803,9 +852,11 @@ class GravityEnv:
 __all__ = [
     "ACTION_HOLD_STEPS",
     "ACTION_VECTORS",
+    "CURRICULUM_LEVELS",
     "MAX_ASTEROIDS",
     "MAX_PLANETS",
     "OBSERVATION_DIM",
     "GravityEnv",
     "action_to_vector",
+    "curriculum_level_for_seed",
 ]

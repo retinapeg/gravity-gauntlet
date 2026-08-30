@@ -25,7 +25,7 @@ try:
         action_to_vector,
     )
     from rl_policy import create_policy, encode_policy_weights
-    from rollout_worker import execute_job
+    from rollout_worker import _json_safe, execute_job
 except ImportError:  # The project requirements may not yet be installed.
     torch = None
     nn = None
@@ -120,6 +120,34 @@ class ReinforceUpdateTests(unittest.TestCase):
             self.assertTrue(math.isfinite(metrics[key]), key)
         self.assertGreater(metrics["entropy"], 0.0)
         self.assertLessEqual(metrics["gradient_norm"], 100.0)
+        self.assertIs(metrics["weights_changed"], True)
+        self.assertGreater(metrics["changed_parameter_tensors"], 0)
+        self.assertGreater(metrics["changed_parameter_elements"], 0)
+        self.assertGreater(metrics["parameter_l2_delta"], 0.0)
+        self.assertGreater(metrics["parameter_max_abs_delta"], 0.0)
+
+    def test_no_effect_update_is_rejected_without_claiming_new_weights(self) -> None:
+        before = [parameter.detach().clone() for parameter in self.model.parameters()]
+        zero_signal_rollout = {
+            "observations": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            "actions": [0, 1],
+            "rewards": [0.0, 0.0],
+        }
+
+        with self.assertRaisesRegex(trainer.PolicyUpdateError, "no parameter change"):
+            trainer.reinforce_update(
+                self.model,
+                self.optimizer,
+                [zero_signal_rollout],
+                entropy_coef=0.0,
+            )
+
+        self.assertTrue(
+            all(
+                torch.equal(old, new)
+                for old, new in zip(before, self.model.parameters())
+            )
+        )
 
     def test_empty_batch_is_rejected_without_changing_weights(self) -> None:
         before = [parameter.detach().clone() for parameter in self.model.parameters()]
@@ -223,6 +251,15 @@ class GenerationMetricsTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), len(set(first)))
         self.assertNotEqual(first, other_generation)
+
+    def test_seed_batches_follow_deterministic_curriculum_bands(self) -> None:
+        early = trainer.generation_seeds(123, generation=0, worlds=64)
+        middle = trainer.generation_seeds(123, generation=6, worlds=64)
+        full = trainer.generation_seeds(123, generation=9, worlds=64)
+
+        self.assertEqual({seed % 4 for seed in early}, {0})
+        self.assertTrue({seed % 4 for seed in middle}.issubset({0, 1, 2}))
+        self.assertEqual({seed % 4 for seed in full}, {0, 1, 2, 3})
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
@@ -333,7 +370,7 @@ class WorkerTrainingContractTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {"DAYTONA_SANDBOX_ID": "forged-local-environment-id"},
-            clear=True,
+            clear=False,
         ):
             result = execute_job(self._job(None))
 
@@ -391,6 +428,28 @@ class WorkerTrainingContractTests(unittest.TestCase):
             with self.subTest(policy_version=job["policy_version"]):
                 with self.assertRaises(ValueError):
                     execute_job(job)
+
+    def test_encoded_policy_controls_actions_instead_of_using_v0_randomness(self) -> None:
+        model = create_policy(OBSERVATION_DIM, seed=55)
+        forced_action = 3
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+            model.action_head.bias[forced_action] = 80.0
+
+        neural = execute_job(self._job(encode_policy_weights(model), max_steps=12))
+        random_v0 = execute_job(self._job(None, max_steps=12))
+
+        self.assertEqual(neural["policy_mode"], "neural_policy")
+        self.assertTrue(neural["actions"])
+        self.assertTrue(all(action == forced_action for action in neural["actions"]))
+        self.assertNotEqual(neural["actions"], random_v0["actions"])
+
+    def test_json_safety_rejects_non_finite_values_before_transport(self) -> None:
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "non-finite"):
+                    _json_safe({"reward": value})
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
@@ -493,6 +552,40 @@ class DaytonaTrainingBoundaryTests(unittest.TestCase):
             self.assertIn("GENERATION 01", rendered)
             self.assertIn("Daytona worlds: 2", rendered)
             self.assertIn("Policy updated → v2", rendered)
+
+    def test_no_effect_generation_does_not_advance_or_save_next_policy(self) -> None:
+        async def zero_signal_generation(**kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "observations": [[0.0, 0.0, 0.0]],
+                    "actions": [0],
+                    "rewards": [0.0],
+                    "reward": 0.0,
+                }
+                for _ in kwargs["seeds"]
+            ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.object(
+                trainer,
+                "_load_daytona_run_generation",
+                return_value=zero_signal_generation,
+            ):
+                with self.assertRaises(trainer.PolicyUpdateError):
+                    asyncio.run(
+                        trainer.run_daytona_training(
+                            generations=1,
+                            worlds=2,
+                            max_steps=1,
+                            obs_dim=3,
+                            base_seed=99,
+                            entropy_coef=0.0,
+                            checkpoint_dir=temporary_directory,
+                        )
+                    )
+
+            self.assertTrue((Path(temporary_directory) / "policy_v000.pt").is_file())
+            self.assertFalse((Path(temporary_directory) / "policy_v001.pt").exists())
 
 
 class VisualTrajectoryIntegrityTests(unittest.TestCase):

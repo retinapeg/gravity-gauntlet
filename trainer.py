@@ -24,10 +24,11 @@ from torch.distributions import Categorical
 
 GAMMA = 0.99
 ENTROPY_COEF = 0.01
-LEARNING_RATE = 3.0e-4
+LEARNING_RATE = 3.0e-3
 MAX_GRAD_NORM = 1.0
 NUM_ACTIONS = 9
 DEFAULT_BASE_SEED = 18_473
+CURRICULUM_GENERATIONS_PER_STAGE = 3
 
 Rollout = Mapping[str, Any]
 RunGeneration = Callable[..., Awaitable[Sequence[Rollout]] | Sequence[Rollout]]
@@ -44,6 +45,10 @@ RolloutValidator = Callable[
 
 class RolloutValidationError(ValueError):
     """Raised when a rollout cannot safely be used for an on-policy update."""
+
+
+class PolicyUpdateError(RuntimeError):
+    """Raised when an optimizer step cannot truthfully create a new policy."""
 
 
 def compute_reward_to_go(
@@ -151,7 +156,7 @@ def reinforce_update(
     gamma: float = GAMMA,
     entropy_coef: float = ENTROPY_COEF,
     max_grad_norm: float = MAX_GRAD_NORM,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | bool]:
     """Perform one robust batch REINFORCE update.
 
     All observations, categorical actions, and rewards are validated before
@@ -174,6 +179,13 @@ def reinforce_update(
         device=device,
     )
     advantages = normalize_advantages(returns).detach()
+
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    parameters_before = [
+        parameter.detach().clone() for parameter in trainable_parameters
+    ]
 
     optimizer.zero_grad(set_to_none=True)
     logits = model(observations)
@@ -207,7 +219,40 @@ def reinforce_update(
         raise FloatingPointError("policy gradient is non-finite")
     optimizer.step()
 
+    changed_parameter_tensors = 0
+    changed_parameter_elements = 0
+    squared_parameter_delta = 0.0
+    max_parameter_delta = 0.0
+    with torch.no_grad():
+        for before, after in zip(parameters_before, trainable_parameters):
+            if not torch.isfinite(after).all().item():
+                raise FloatingPointError(
+                    "optimizer produced non-finite policy parameters"
+                )
+            delta = after.detach() - before
+            changed_elements = int(torch.count_nonzero(delta).item())
+            if changed_elements:
+                changed_parameter_tensors += 1
+                changed_parameter_elements += changed_elements
+                squared_parameter_delta += float(
+                    torch.sum(delta.to(dtype=torch.float64) ** 2).item()
+                )
+                max_parameter_delta = max(
+                    max_parameter_delta,
+                    float(torch.max(torch.abs(delta)).item()),
+                )
+
+    if changed_parameter_elements == 0:
+        raise PolicyUpdateError(
+            "REINFORCE produced no parameter change; policy version was not advanced"
+        )
+
     return {
+        "weights_changed": True,
+        "changed_parameter_tensors": changed_parameter_tensors,
+        "changed_parameter_elements": changed_parameter_elements,
+        "parameter_l2_delta": math.sqrt(squared_parameter_delta),
+        "parameter_max_abs_delta": max_parameter_delta,
         "episodes": episode_count,
         "transitions": int(observations.shape[0]),
         "loss": float(loss.detach().item()),
@@ -259,7 +304,13 @@ def summarize_generation(rollouts: Sequence[Rollout]) -> dict[str, float | int |
 
 
 def generation_seeds(base_seed: int, generation: int, worlds: int) -> list[int]:
-    """Derive distinct, reproducible universe seeds without global RNG state."""
+    """Derive distinct seeds from the curriculum bands without global RNG state.
+
+    Universe difficulty is encoded by the seed itself, so a recorded seed still
+    reconstructs its exact world with no hidden generation parameter.  The
+    first three generations use level 0; each three-generation stage admits
+    one additional level until the complete procedural distribution is active.
+    """
 
     base_seed = int(base_seed)
     generation = int(generation)
@@ -269,11 +320,26 @@ def generation_seeds(base_seed: int, generation: int, worlds: int) -> list[int]:
     if worlds <= 0:
         raise ValueError("worlds must be positive")
 
-    # Separate deterministic streams for each generation, then sample without
-    # replacement so a requested batch can never contain duplicate worlds.
+    curriculum_level_count, curriculum_level_for_seed = _load_curriculum_contract()
+
+    maximum_level = min(
+        curriculum_level_count - 1,
+        generation // CURRICULUM_GENERATIONS_PER_STAGE,
+    )
+
+    # Separate deterministic streams for each generation, then reject seed
+    # bands above the current stage.  Sampling remains without replacement.
     stream_seed = base_seed + generation * 1_000_003
     generator = random.Random(stream_seed)
-    return generator.sample(range(0, 2**31), worlds)
+    seeds: list[int] = []
+    seen: set[int] = set()
+    while len(seeds) < worlds:
+        candidate = generator.randrange(0, 2**31)
+        if candidate in seen or curriculum_level_for_seed(candidate) > maximum_level:
+            continue
+        seen.add(candidate)
+        seeds.append(candidate)
+    return seeds
 
 
 async def run_daytona_training(
@@ -386,6 +452,8 @@ async def run_daytona_training(
             max_grad_norm=max_grad_norm,
         )
         next_version = policy_version + 1
+        _, curriculum_level_for_seed = _load_curriculum_contract()
+        curriculum_levels = [curriculum_level_for_seed(seed) for seed in seeds]
         checkpoint_path = checkpoint_root / f"policy_v{next_version:03d}.pt"
         _save_checkpoint(
             checkpoint_path,
@@ -400,6 +468,8 @@ async def run_daytona_training(
             "policy_version": policy_version,
             "next_policy_version": next_version,
             "seeds": seeds,
+            "curriculum_levels": curriculum_levels,
+            "curriculum_max_level": max(curriculum_levels),
             "checkpoint": str(checkpoint_path),
             **generation_metrics,
             **update_metrics,
@@ -604,6 +674,16 @@ def _resolve_observation_dim(obs_dim: int | None) -> int:
     return _positive_int(obs_dim, "obs_dim")
 
 
+def _load_curriculum_contract() -> tuple[int, Callable[[int], int]]:
+    """Load headless seed metadata without constructing a local environment."""
+
+    try:
+        from gravity_env import CURRICULUM_LEVELS, curriculum_level_for_seed
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("gravity curriculum metadata is unavailable") from exc
+    return CURRICULUM_LEVELS, curriculum_level_for_seed
+
+
 def _load_daytona_run_generation() -> RunGeneration:
     try:
         from daytona_orchestrator import run_generation
@@ -730,6 +810,7 @@ __all__ = [
     "GenerationCallback",
     "LEARNING_RATE",
     "MAX_GRAD_NORM",
+    "PolicyUpdateError",
     "LifecycleCallback",
     "RolloutValidationError",
     "RolloutValidator",
